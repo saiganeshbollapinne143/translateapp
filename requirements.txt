@@ -106,4 +106,8 @@ yarl==1.25.1
 python-docx
 pypdf
 streamlit
-sentence transformers
+streamlit
+python-docx
+pypdf
+chromadb
+sentence-transformers
