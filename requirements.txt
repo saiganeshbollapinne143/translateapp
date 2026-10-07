@@ -111,3 +111,4 @@ python-docx
 pypdf
 chromadb
 sentence-transformers
+torchvision==0.29.1
