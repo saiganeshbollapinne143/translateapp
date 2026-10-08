@@ -6,9 +6,9 @@ from docx import Document
 
 MODEL = "facebook/nllb-200-distilled-600M"
 LANG = {
-    "English":"eng_Latn","Tamil":"tam_Taml","Telugu":"tel_Telu",
-    "Hindi":"hin_Deva","Kannada":"kan_Knda","Malayalam":"mal_Mlym",
-    "French":"fra_Latn","German":"deu_Latn","Spanish":"spa_Latn"
+    "English": "eng_Latn", "Tamil": "tam_Taml", "Telugu": "tel_Telu",
+    "Hindi": "hin_Deva", "Kannada": "kan_Knda", "Malayalam": "mal_Mlym",
+    "French": "fra_Latn", "German": "deu_Latn", "Spanish": "spa_Latn"
 }
 
 st.set_page_config(page_title="AI Translator", page_icon="🌐", layout="wide")
@@ -61,13 +61,17 @@ def read_file(file):
 # ================= TRANSLATION =================
 def translate(text, source, target):
     tokenizer, model, device = load_model()
+    
     tokenizer.src_lang = source
-    target_id = tokenizer.convert_tokens_to_ids(target)
+    try:
+        target_id = tokenizer.lang_code_to_id[target]
+    except (KeyError, AttributeError):
+        target_id = tokenizer.convert_tokens_to_ids(target)
 
-    chunks = [text[i:i+1200] for i in range(0, len(text), 1200)]
+    chunks = [text[i:i+600] for i in range(0, len(text), 600)]
     results = []
-    progress = st.progress(0)
-
+    
+    progress_bar = st.progress(0)
     batch_size = 4 if device == "cuda" else 1
 
     for start in range(0, len(chunks), batch_size):
@@ -90,18 +94,13 @@ def translate(text, source, target):
                 do_sample=False
             )
 
-        results.extend(
-            tokenizer.batch_decode(
-                output,
-                skip_special_tokens=True
-            )
-        )
+        decoded = tokenizer.batch_decode(output, skip_special_tokens=True)
+        results.extend(decoded)
 
-        progress.progress(
-            min((start + len(batch)) / len(chunks), 1.0)
-        )
+        progress_val = min((start + len(batch)) / len(chunks), 1.0)
+        progress_bar.progress(progress_val)
 
-    progress.empty()
+    progress_bar.empty()
     return "\n\n".join(results)
 
 # ================= SAVE HISTORY =================
@@ -118,7 +117,7 @@ def save_history(source, target, original, translated):
         }]
     )
 
-# ================= HISTORY =================
+# ================= HISTORY DISPLAY =================
 def show_history(search=""):
     db = get_db()
 
@@ -157,7 +156,6 @@ def show_history(search=""):
 
         with st.expander(f"🌐 {source} → {target} • Thread {thread} • {time}"):
             st.caption(f"🧵 Thread ID: `{thread}`")
-
             c1, c2 = st.columns(2)
 
             with c1:
@@ -178,60 +176,44 @@ def show_history(search=""):
 
 # ================= HEADER =================
 st.markdown('<div class="title">🌐 AI Translator</div>', unsafe_allow_html=True)
-st.markdown('<div class="sub">Fast multilingual translation powered by NLLB-200</div>',
-            unsafe_allow_html=True)
+st.markdown('<div class="sub">Fast multilingual translation powered by NLLB-200</div>', unsafe_allow_html=True)
 
-# ================= LANGUAGE =================
+# ================= LANGUAGE SELECT =================
 c1, c2 = st.columns(2)
-
 source_name = c1.selectbox("Source Language", list(LANG.keys()))
 target_name = c2.selectbox("Target Language", list(LANG.keys()), index=1)
 
-# ================= INPUT =================
+# ================= INPUT SECTION =================
+uploaded = st.file_uploader("📁 Upload TXT / PDF / DOCX", type=["txt", "pdf", "docx"])
+
+input_text = ""
+if uploaded:
+    input_text = read_file(uploaded)
+    if input_text.strip():
+        st.success(f"📄 {uploaded.name} loaded successfully")
+
 text = st.text_area(
     "Text to translate",
+    value=input_text,
     height=160,
     placeholder="Type or paste text here..."
 )
 
-uploaded = st.file_uploader(
-    "📁 Upload TXT / PDF / DOCX",
-    type=["txt", "pdf", "docx"]
-)
-
-if uploaded:
-    text = read_file(uploaded)
-    if text:
-        st.success(f"📄 {uploaded.name} loaded successfully")
-
-# ================= TRANSLATE =================
+# ================= TRANSLATE BUTTON =================
 if st.button("🚀 Translate", type="primary", use_container_width=True):
-
     if not text.strip():
-        st.warning("Please enter text or upload a document.")
-
+        st.warning("Please enter text or upload a valid document.")
     elif source_name == target_name:
-        st.warning("Please select different languages.")
-
+        st.warning("Please select different source and target languages.")
     else:
         with st.spinner("Translating..."):
-            result = translate(
-                text,
-                LANG[source_name],
-                LANG[target_name]
-            )
+            result = translate(text, LANG[source_name], LANG[target_name])
 
-        save_history(
-            source_name,
-            target_name,
-            text,
-            result
-        )
+        save_history(source_name, target_name, text, result)
 
         st.success("✅ Translation completed.")
-        st.subheader("Translation")
-
-        st.text_area("Result", result, height=300)
+        st.subheader("Translation Result")
+        st.text_area("Result Output", result, height=250)
 
         st.download_button(
             "📥 Download Translation",
@@ -243,7 +225,6 @@ if st.button("🚀 Translate", type="primary", use_container_width=True):
 
 # ================= CURRENT THREAD =================
 st.divider()
-
 c1, c2 = st.columns([4, 1])
 
 with c1:
@@ -255,18 +236,14 @@ with c2:
         st.session_state.thread_id += 1
         st.rerun()
 
-# ================= HISTORY =================
+# ================= HISTORY SECTION =================
 st.divider()
 st.subheader("🕘 Translation History")
 
-search = st.text_input(
-    "🔍 Search History",
-    placeholder="Search text, language or thread ID..."
-)
-
+search = st.text_input("🔍 Search History", placeholder="Search text, language or thread ID...")
 show_history(search)
 
-if st.button("🗑️ Clear All"):
+if st.button("🗑️ Clear All History"):
     ids = get_db().get()["ids"]
     if ids:
         get_db().delete(ids=ids)
