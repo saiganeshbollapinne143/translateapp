@@ -1,12 +1,8 @@
-streamlit
+﻿streamlit
 torch
+torchvision
 transformers
-sentence-transformers
+sentencepiece
+chromadb
 pypdf
 python-docx
-reportlab
-sentencepiece
-fpdf2
-uharfbuzz
-chromadb
-torchvision
