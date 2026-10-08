@@ -1,4 +1,4 @@
-streamlit
+﻿streamlit
 torch
 transformers
 sentence-transformers
