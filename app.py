@@ -1,5 +1,4 @@
 import os
-
 os.environ.setdefault("HF_HUB_DISABLE_SYMLINKS_WARNING", "1")
 os.environ.setdefault("TOKENIZERS_PARALLELISM", "false")
 
@@ -17,1334 +16,435 @@ from docx import Document
 from pypdf import PdfReader
 from transformers import AutoModelForSeq2SeqLM, AutoTokenizer
 
-
-# ============================================================
-# CONFIG
-# ============================================================
+st.set_page_config(page_title="Translation Chat", page_icon="💬", layout="wide")
 
 MODEL_NAME = "facebook/nllb-200-distilled-600M"
 EMBED_MODEL = "paraphrase-multilingual-MiniLM-L12-v2"
 DB_PATH = "chroma_db"
-
 DEVICE = "cuda" if torch.cuda.is_available() else "cpu"
-
 BATCH_SIZE = 16 if DEVICE == "cuda" else 8
 NUM_BEAMS = 4 if DEVICE == "cuda" else 2
-
 MAX_CHUNK_CHARS = 400
 MAX_INPUT_TOKENS = 256
-
-HISTORY_LIMIT = 20
 PREVIEW_CHARS = 1500
 
-QUANTIZE_ON_CPU = False
-
-
 LANGUAGES = {
-    "English": "eng_Latn",
-    "Hindi": "hin_Deva",
-    "Telugu": "tel_Telu",
-    "Tamil": "tam_Taml",
-    "Kannada": "kan_Knda",
-    "Malayalam": "mal_Mlym",
-    "French": "fra_Latn",
-    "German": "deu_Latn",
-    "Spanish": "spa_Latn",
+    "English": "eng_Latn", "Hindi": "hin_Deva", "Telugu": "tel_Telu",
+    "Tamil": "tam_Taml", "Kannada": "kan_Knda", "Malayalam": "mal_Mlym",
+    "French": "fra_Latn", "German": "deu_Latn", "Spanish": "spa_Latn",
     "Italian": "ita_Latn",
 }
 
-
-# ============================================================
-# MODEL
-# ============================================================
-
 @st.cache_resource(show_spinner="Loading NLLB-200 model...")
 def load_model():
-
     tokenizer = AutoTokenizer.from_pretrained(MODEL_NAME)
-
-    model = AutoModelForSeq2SeqLM.from_pretrained(
-        MODEL_NAME
-    ).eval()
-
+    model = AutoModelForSeq2SeqLM.from_pretrained(MODEL_NAME).eval()
     if DEVICE == "cuda":
-
         model = model.half().to(DEVICE)
-
-    elif QUANTIZE_ON_CPU:
-
-        model = torch.quantization.quantize_dynamic(
-            model,
-            {torch.nn.Linear},
-            dtype=torch.qint8,
-        )
-
     return tokenizer, model
 
-
-# ============================================================
-# CHROMA DATABASE
-# ============================================================
-
 @st.cache_resource(show_spinner="Opening Chroma database...")
-def get_collection():
-
-    client = chromadb.PersistentClient(
-        path=DB_PATH
+def get_chroma():
+    client = chromadb.PersistentClient(path=DB_PATH)
+    embedding = embedding_functions.SentenceTransformerEmbeddingFunction(
+        model_name=EMBED_MODEL, device=DEVICE
     )
-
-    ef = embedding_functions.SentenceTransformerEmbeddingFunction(
-        model_name=EMBED_MODEL,
-        device=DEVICE,
-    )
-
-    return client.get_or_create_collection(
-        name="translations",
-        embedding_function=ef,
+    translation_memory = client.get_or_create_collection(
+        name="translation_memory",
+        embedding_function=embedding,
         metadata={"hnsw:space": "cosine"},
     )
+    chat_history = client.get_or_create_collection(
+        name="chat_history",
+        embedding_function=embedding,
+        metadata={"hnsw:space": "cosine"},
+    )
+    return translation_memory, chat_history
 
+translation_memory, chat_history = get_chroma()
 
-# ============================================================
-# TRANSLATION
-# ============================================================
+def create_thread_id():
+    return str(uuid.uuid4())
 
-def translate_batch(
-    texts,
-    src_code,
-    tgt_code,
-    tokenizer,
-    model,
-    on_progress=None,
-):
+if "thread_id" not in st.session_state:
+    st.session_state.thread_id = create_thread_id()
 
+if "messages" not in st.session_state:
+    st.session_state.messages = []
+
+def translate_batch(texts, src_code, tgt_code, tokenizer, model):
     tokenizer.src_lang = src_code
-
-    forced_bos = tokenizer.convert_tokens_to_ids(
-        tgt_code
-    )
-
-    order = sorted(
-        range(len(texts)),
-        key=lambda i: len(texts[i])
-    )
-
+    forced_bos = tokenizer.convert_tokens_to_ids(tgt_code)
+    order = sorted(range(len(texts)), key=lambda i: len(texts[i]))
     results = [""] * len(texts)
 
-    for start in range(
-        0,
-        len(order),
-        BATCH_SIZE,
-    ):
-
-        idx = order[
-            start:start + BATCH_SIZE
-        ]
-
-        batch = [
-            texts[i]
-            for i in idx
-        ]
+    for start in range(0, len(order), BATCH_SIZE):
+        idx = order[start:start + BATCH_SIZE]
+        batch = [texts[i] for i in idx]
 
         inputs = tokenizer(
-            batch,
-            return_tensors="pt",
-            padding=True,
-            truncation=True,
-            max_length=MAX_INPUT_TOKENS,
+            batch, return_tensors="pt", padding=True,
+            truncation=True, max_length=MAX_INPUT_TOKENS
         ).to(DEVICE)
 
-        max_new = min(
-            int(
-                inputs["input_ids"].shape[1] * 1.5
-            ) + 10,
-            400,
-        )
+        max_new = min(int(inputs["input_ids"].shape[1] * 1.5) + 10, 400)
 
         with torch.inference_mode():
-
-            out = model.generate(
+            output = model.generate(
                 **inputs,
                 forced_bos_token_id=forced_bos,
                 max_new_tokens=max_new,
                 num_beams=NUM_BEAMS,
             )
 
-        decoded = tokenizer.batch_decode(
-            out,
-            skip_special_tokens=True,
-        )
+        decoded = tokenizer.batch_decode(output, skip_special_tokens=True)
 
-        for i, t in zip(
-            idx,
-            decoded,
-        ):
-
-            results[i] = t
-
-        if on_progress:
-
-            on_progress(
-                min(
-                    start + BATCH_SIZE,
-                    len(order),
-                ),
-                len(order),
-            )
+        for i, text in zip(idx, decoded):
+            results[i] = text
 
     return results
 
-
-# ============================================================
-# TRANSLATION MEMORY
-# ============================================================
-
-def make_id(
-    text,
-    src_lang,
-    tgt_lang,
-):
-
+def translation_id(text, src_lang, tgt_lang):
     return hashlib.sha1(
-        f"{src_lang}|{tgt_lang}|{text}".encode(
-            "utf-8"
-        )
+        f"{src_lang}|{tgt_lang}|{text}".encode()
     ).hexdigest()
 
-
-def memory_lookup(
-    collection,
-    texts,
-    src_lang,
-    tgt_lang,
-):
-
-    ids = {
-        make_id(
-            t,
-            src_lang,
-            tgt_lang,
-        ): t
-        for t in texts
-    }
-
-    if not ids:
+def get_saved_translations(texts, src_lang, tgt_lang):
+    if not texts or translation_memory.count() == 0:
         return {}
 
-    if collection.count() == 0:
-        return {}
+    ids = [translation_id(x, src_lang, tgt_lang) for x in texts]
+    result = translation_memory.get(ids=ids, include=["metadatas"])
+    saved = {}
 
-    found = collection.get(
-        ids=list(ids),
-        include=["metadatas"],
-    )
+    for record_id, metadata in zip(result["ids"], result["metadatas"]):
+        index = ids.index(record_id)
+        saved[texts[index]] = metadata["translation"]
 
-    return {
-        ids[i]: m["translation"]
-        for i, m in zip(
-            found["ids"],
-            found["metadatas"],
-        )
-    }
+    return saved
 
-
-def save_records(
-    collection,
-    pairs,
-    src_lang,
-    tgt_lang,
-    source="",
-    thread_id="",
-):
-
+def save_translation_memory(pairs, src_lang, tgt_lang, source=""):
     if not pairs:
         return
 
-    now = time.time()
-
-    collection.upsert(
-
-        ids=[
-            make_id(
-                s,
-                src_lang,
-                tgt_lang,
-            )
-            for s, _ in pairs
-        ],
-
-        documents=[
-            s
-            for s, _ in pairs
-        ],
-
+    translation_memory.upsert(
+        ids=[translation_id(x, src_lang, tgt_lang) for x, _ in pairs],
+        documents=[x for x, _ in pairs],
         metadatas=[
-
             {
-                "translation": t,
+                "translation": y,
                 "src_lang": src_lang,
                 "tgt_lang": tgt_lang,
-                "ts": now + i * 1e-3,
                 "source": source,
-                "thread_id": thread_id,
+                "ts": time.time() + i * 0.001,
             }
-
-            for i, (_, t) in enumerate(pairs)
+            for i, (_, y) in enumerate(pairs)
         ],
     )
 
-
-def run_translation(
-    texts,
-    src_lang,
-    tgt_lang,
-    tokenizer,
-    model,
-    collection,
-    source="",
-    thread_id="",
-    on_progress=None,
-):
-
-    unique = list(
-        dict.fromkeys(texts)
+def save_chat_message(thread_id, role, content, src_lang="", tgt_lang="", source=""):
+    message_id = str(uuid.uuid4())
+    chat_history.upsert(
+        ids=[hashlib.sha1(f"{thread_id}|{message_id}".encode()).hexdigest()],
+        documents=[content],
+        metadatas=[{
+            "thread_id": thread_id,
+            "role": role,
+            "src_lang": src_lang,
+            "tgt_lang": tgt_lang,
+            "source": source,
+            "ts": time.time(),
+            "message_id": message_id,
+        }],
     )
 
-    done = memory_lookup(
-        collection,
-        unique,
-        src_lang,
-        tgt_lang,
-    )
-
-    todo = [
-        t
-        for t in unique
-        if t not in done
-    ]
-
-    if todo:
-
-        new = translate_batch(
-
-            todo,
-
-            LANGUAGES[src_lang],
-
-            LANGUAGES[tgt_lang],
-
-            tokenizer,
-
-            model,
-
-            on_progress,
-        )
-
-        save_records(
-
-            collection,
-
-            list(
-                zip(
-                    todo,
-                    new,
-                )
-            ),
-
-            src_lang,
-            tgt_lang,
-
-            source,
-
-            thread_id,
-        )
-
-        done.update(
-            zip(
-                todo,
-                new,
-            )
-        )
-
-    return (
-        [done[t] for t in texts],
-        len(unique) - len(todo),
-    )
-
-
-# ============================================================
-# THREAD MANAGEMENT
-# ============================================================
-
-def create_thread():
-
-    return str(
-        uuid.uuid4()
-    )
-
-
-def get_threads(collection):
-
-    if collection.count() == 0:
+def load_thread(thread_id):
+    if chat_history.count() == 0:
         return []
 
-    data = collection.get(
-        include=[
-            "documents",
-            "metadatas",
-        ]
-    )
-
-    threads = {}
-
-    for doc, meta in zip(
-        data["documents"],
-        data["metadatas"],
-    ):
-
-        thread_id = meta.get(
-            "thread_id"
-        )
-
-        if not thread_id:
-            continue
-
-        ts = meta.get(
-            "ts",
-            0,
-        )
-
-        if thread_id not in threads:
-
-            threads[thread_id] = {
-
-                "thread_id": thread_id,
-
-                "first_message": doc,
-
-                "last_ts": ts,
-
-                "count": 0,
-            }
-
-        threads[
-            thread_id
-        ]["last_ts"] = max(
-            threads[
-                thread_id
-            ]["last_ts"],
-            ts,
-        )
-
-        threads[
-            thread_id
-        ]["count"] += 1
-
-    return sorted(
-
-        threads.values(),
-
-        key=lambda x: x["last_ts"],
-
-        reverse=True,
-    )
-
-
-def load_thread_history(
-    collection,
-    thread_id,
-):
-
-    if collection.count() == 0:
-        return []
-
-    data = collection.get(
-
-        where={
-            "thread_id": thread_id
-        },
-
-        include=[
-            "documents",
-            "metadatas",
-        ],
+    result = chat_history.get(
+        where={"thread_id": thread_id},
+        include=["documents", "metadatas"],
     )
 
     rows = sorted(
-
-        zip(
-            data["documents"],
-            data["metadatas"],
-        ),
-
-        key=lambda r: r[1].get(
-            "ts",
-            0,
-        ),
+        zip(result["documents"], result["metadatas"]),
+        key=lambda x: x[1].get("ts", 0),
     )
 
-    messages = []
+    return [
+        {"role": metadata["role"], "content": document}
+        for document, metadata in rows
+    ]
 
-    for doc, meta in rows:
+def get_past_threads():
+    if chat_history.count() == 0:
+        return []
 
-        messages.append({
+    result = chat_history.get(include=["documents", "metadatas"])
+    threads = {}
 
-            "role": "user",
+    for document, metadata in zip(result["documents"], result["metadatas"]):
+        tid = metadata.get("thread_id")
+        if not tid:
+            continue
 
-            "content": doc,
+        if tid not in threads:
+            threads[tid] = {
+                "thread_id": tid,
+                "title": document,
+                "timestamp": metadata.get("ts", 0),
+            }
 
-        })
+    return sorted(
+        threads.values(),
+        key=lambda x: x["timestamp"],
+        reverse=True,
+    )
 
-        messages.append({
+def run_translation(texts, src_lang, tgt_lang, tokenizer, model, source=""):
+    unique = list(dict.fromkeys(texts))
+    saved = get_saved_translations(unique, src_lang, tgt_lang)
+    todo = [x for x in unique if x not in saved]
+    reused = len(unique) - len(todo)
 
-            "role": "assistant",
+    if todo:
+        translated = translate_batch(
+            todo, LANGUAGES[src_lang], LANGUAGES[tgt_lang],
+            tokenizer, model
+        )
+        pairs = list(zip(todo, translated))
+        save_translation_memory(pairs, src_lang, tgt_lang, source)
+        saved.update(pairs)
 
-            "content":
-                f"**{meta['tgt_lang']}:** "
-                f"{meta['translation']}",
-
-        })
-
-    return messages
-
-
-# ============================================================
-# FILE HANDLING
-# ============================================================
+    return [saved[x] for x in texts], reused
 
 def extract_text(uploaded):
-
     name = uploaded.name.lower()
 
     if name.endswith(".txt"):
-
-        return uploaded.getvalue().decode(
-            "utf-8",
-            errors="ignore",
-        )
+        return uploaded.getvalue().decode("utf-8", errors="ignore")
 
     if name.endswith(".pdf"):
-
-        return "\n".join(
-
-            (
-                p.extract_text()
-                or ""
-            )
-
-            for p in PdfReader(
-                uploaded
-            ).pages
-        )
+        return "\n".join(page.extract_text() or "" for page in PdfReader(uploaded).pages)
 
     if name.endswith(".docx"):
-
-        return "\n".join(
-
-            p.text
-
-            for p in Document(
-                uploaded
-            ).paragraphs
-        )
+        return "\n".join(p.text for p in Document(uploaded).paragraphs)
 
     return ""
 
-
-def _hard_wrap(
-    sentence,
-    max_chars,
-):
-
-    parts = []
-
-    current = ""
-
-    for word in sentence.split():
-
-        if (
-            current
-            and len(current)
-            + len(word)
-            + 1
-            > max_chars
-        ):
-
-            parts.append(
-                current
-            )
-
-            current = word
-
-        else:
-
-            current = (
-                f"{current} {word}"
-                .strip()
-            )
-
-    if current:
-
-        parts.append(
-            current
-        )
-
-    return parts
-
-
-def split_into_chunks(
-    text,
-    max_chars=MAX_CHUNK_CHARS,
-):
-
+def split_into_chunks(text):
     chunks = []
-
-    for para in (
-
-        p.strip()
-
-        for p in text.splitlines()
-
-        if p.strip()
-    ):
-
+    for paragraph in (p.strip() for p in text.splitlines() if p.strip()):
+        sentences = re.split(r"(?<=[.!?।])\s+", paragraph)
         current = ""
 
-        for s in re.split(
-            r"(?<=[.!?।])\s+",
-            para,
-        ):
+        for sentence in sentences:
+            words = sentence.split()
+            parts = []
+            temp = ""
 
-            pieces = (
-
-                _hard_wrap(
-                    s,
-                    max_chars,
-                )
-
-                if len(s) > max_chars
-
-                else [s]
-            )
-
-            for piece in pieces:
-
-                if (
-
-                    current
-
-                    and len(current)
-                    + len(piece)
-                    + 1
-                    > max_chars
-                ):
-
-                    chunks.append(
-                        current
-                    )
-
-                    current = piece
-
+            for word in words:
+                if temp and len(temp) + len(word) + 1 > MAX_CHUNK_CHARS:
+                    parts.append(temp)
+                    temp = word
                 else:
+                    temp = f"{temp} {word}".strip()
 
-                    current = (
-                        f"{current} {piece}"
-                        .strip()
-                    )
+            if temp:
+                parts.append(temp)
+
+            for part in parts:
+                if current and len(current) + len(part) + 1 > MAX_CHUNK_CHARS:
+                    chunks.append(current)
+                    current = part
+                else:
+                    current = f"{current} {part}".strip()
 
         if current:
-
-            chunks.append(
-                current
-            )
+            chunks.append(current)
 
     return chunks
 
-
-# ============================================================
-# MESSAGE HANDLERS
-# ============================================================
-
-def handle_text(
-    text,
-    src_lang,
-    tgt_lang,
-    tokenizer,
-    model,
-    collection,
-    thread_id,
-):
-
-    with st.spinner(
-        "Translating..."
-    ):
-
-        (result,), _ = run_translation(
-
-            [text],
-
-            src_lang,
-
-            tgt_lang,
-
-            tokenizer,
-
-            model,
-
-            collection,
-
-            thread_id=thread_id,
+def handle_text(text, src_lang, tgt_lang, tokenizer, model):
+    with st.spinner("Translating..."):
+        (result,), reused = run_translation(
+            [text], src_lang, tgt_lang, tokenizer, model
         )
 
-    return {
+    answer = f"**{tgt_lang}:** {result}"
 
-        "role": "assistant",
+    save_chat_message(
+        st.session_state.thread_id, "user",
+        text, src_lang, tgt_lang
+    )
+    save_chat_message(
+        st.session_state.thread_id, "assistant",
+        answer, src_lang, tgt_lang
+    )
 
-        "content":
-            f"**{tgt_lang}:** {result}",
-    }
+    return {"role": "assistant", "content": answer}
 
-
-def handle_file(
-    f,
-    src_lang,
-    tgt_lang,
-    tokenizer,
-    model,
-    collection,
-    thread_id,
-):
-
+def handle_file(uploaded, src_lang, tgt_lang, tokenizer, model):
     try:
-
-        chunks = split_into_chunks(
-            extract_text(f)
-        )
-
+        text = extract_text(uploaded)
     except Exception as e:
+        return {"role": "assistant", "content": f"Couldn't read **{uploaded.name}**: {e}"}
 
-        return {
+    if not text.strip():
+        return {"role": "assistant", "content": f"No readable text found in **{uploaded.name}**."}
 
-            "role": "assistant",
+    chunks = split_into_chunks(text)
 
-            "content":
-                f"Couldn't read **{f.name}**: {e}",
-        }
-
-    if not chunks:
-
-        return {
-
-            "role": "assistant",
-
-            "content":
-                f"No readable text found in **{f.name}**.",
-        }
-
-    bar = st.progress(
-        0.0,
-        text=f"Translating {f.name}...",
-    )
-
-    def on_progress(
-        done,
-        total,
-    ):
-
-        bar.progress(
-
-            done / total,
-
-            text=
-                f"Translating "
-                f"{f.name} "
-                f"({done}/{total})",
+    with st.spinner(f"Translating {uploaded.name}..."):
+        translated, reused = run_translation(
+            chunks, src_lang, tgt_lang, tokenizer, model, uploaded.name
         )
 
-    translated_chunks, reused = run_translation(
+    full = "\n\n".join(translated)
+    preview = full[:PREVIEW_CHARS] + ("..." if len(full) > PREVIEW_CHARS else "")
 
-        chunks,
+    answer = f"**{tgt_lang} translation of {uploaded.name}:**\n\n{preview}"
 
-        src_lang,
+    if reused:
+        answer += f"\n\n<small>{reused} segment(s) reused from saved translation memory.</small>"
 
-        tgt_lang,
-
-        tokenizer,
-
-        model,
-
-        collection,
-
-        source=f.name,
-
-        thread_id=thread_id,
-
-        on_progress=on_progress,
+    save_chat_message(
+        st.session_state.thread_id, "user",
+        f"📎 {uploaded.name}", src_lang, tgt_lang, uploaded.name
     )
-
-    bar.empty()
-
-    full = "\n\n".join(
-        translated_chunks
-    )
-
-    preview = (
-
-        full[:PREVIEW_CHARS]
-
-        + (
-            "..."
-            if len(full) > PREVIEW_CHARS
-            else ""
-        )
-    )
-
-    note = (
-
-        f"  \n<small>"
-        f"{reused} segment(s) reused "
-        f"from saved translations"
-        f"</small>"
-
-        if reused
-
-        else ""
+    save_chat_message(
+        st.session_state.thread_id, "assistant",
+        answer, src_lang, tgt_lang, uploaded.name
     )
 
     return {
-
         "role": "assistant",
-
-        "content":
-            f"**{tgt_lang} translation "
-            f"of {f.name}:**\n\n"
-            f"{preview}{note}",
-
+        "content": answer,
         "download": {
-
-            "data":
-                full.encode(
-                    "utf-8"
-                ),
-
-            "name":
-                f"{f.name.rsplit('.', 1)[0]}"
-                f"_{tgt_lang}.txt",
+            "data": full.encode("utf-8"),
+            "name": f"{uploaded.name.rsplit('.', 1)[0]}_{tgt_lang}.txt",
         },
     }
 
-
-# ============================================================
-# STREAMLIT UI
-# ============================================================
-
-st.set_page_config(
-
-    page_title="Translation Chat",
-
-    page_icon="💬",
-
-    layout="wide",
-)
-
-
-st.title(
-    "💬 Translation Chat"
-)
-
-
-# ============================================================
-# LOAD MODEL + DATABASE
-# ============================================================
+st.title("💬 Translation Chat")
 
 tokenizer, model = load_model()
 
-collection = get_collection()
-
-
-# ============================================================
-# SESSION STATE
-# ============================================================
-
-if "thread_id" not in st.session_state:
-
-    st.session_state.thread_id = (
-        create_thread()
-    )
-
-
-if "messages" not in st.session_state:
-
-    st.session_state.messages = (
-        load_thread_history(
-            collection,
-            st.session_state.thread_id,
-        )
-    )
-
-
-# ============================================================
-# SIDEBAR
-# ============================================================
+if not st.session_state.messages:
+    st.session_state.messages = load_thread(st.session_state.thread_id)
 
 with st.sidebar:
+    st.header("⚙️ Settings")
 
-    st.header(
-        "⚙️ Settings"
-    )
+    src_lang = st.selectbox("I write in", list(LANGUAGES), index=0)
+    tgt_lang = st.selectbox("Translate to", list(LANGUAGES), index=1)
 
-    src_lang = st.selectbox(
-
-        "I write in",
-
-        list(LANGUAGES),
-
-        index=0,
-
-        key="src",
-    )
-
-    tgt_lang = st.selectbox(
-
-        "Translate to",
-
-        list(LANGUAGES),
-
-        index=1,
-
-        key="tgt",
-    )
-
-
-    def swap_languages():
-
-        st.session_state.src, \
-        st.session_state.tgt = (
-
-            st.session_state.tgt,
-
-            st.session_state.src,
-        )
-
-
-    st.button(
-
-        "⇄ Swap languages",
-
-        on_click=swap_languages,
-    )
-
-
-    # ========================================================
-    # NEW THREAD
-    # ========================================================
-
-    if st.button(
-
-        "➕ New Thread",
-
-        use_container_width=True,
-    ):
-
-        st.session_state.thread_id = (
-            create_thread()
-        )
-
+    if st.button("➕ New Conversation", use_container_width=True):
+        st.session_state.thread_id = create_thread_id()
         st.session_state.messages = []
-
         st.rerun()
 
-
-    # ========================================================
-    # CURRENT THREAD
-    # ========================================================
-
-    st.caption(
-
-        "Current Thread: "
-        + st.session_state.thread_id[:8]
-        + "..."
-    )
-
-
-    # ========================================================
-    # CLEAR CURRENT CHAT VIEW
-    # ========================================================
-
-    if st.button(
-
-        "🗑️ Clear Chat View",
-
-        use_container_width=True,
-    ):
-
-        st.session_state.messages = []
-
-        st.rerun()
-
-
-    st.caption(
-
-        f"Saved records: "
-        f"{collection.count()} "
-        f"· Running on "
-        f"{DEVICE.upper()}"
-    )
-
-
-    # ========================================================
-    # PAST THREADS
-    # ========================================================
+    st.caption("Current conversation")
+    st.code(st.session_state.thread_id)
 
     st.divider()
+    st.header("🗂️ Past Conversations")
 
-    st.header(
-        "🗂️ Past Threads"
-    )
+    for thread in get_past_threads():
+        title = thread["title"][:35]
+        date = datetime.fromtimestamp(thread["timestamp"]).strftime("%d %b %Y, %I:%M %p")
 
-    threads = get_threads(
-        collection
-    )
-
-    if threads:
-
-        for thread in threads:
-
-            title = thread[
-                "first_message"
-            ]
-
-            if len(title) > 35:
-
-                title = (
-                    title[:35]
-                    + "..."
-                )
-
-            timestamp = (
-                datetime.fromtimestamp(
-                    thread["last_ts"]
-                ).strftime(
-                    "%d %b %Y, %I:%M %p"
-                )
-            )
-
-            label = (
-                f"💬 {title}\n"
-                f"🕒 {timestamp}"
-            )
-
-            if st.button(
-
-                label,
-
-                key=
-                    f"thread_"
-                    f"{thread['thread_id']}",
-
-                use_container_width=True,
-            ):
-
-                st.session_state.thread_id = (
-                    thread["thread_id"]
-                )
-
-                st.session_state.messages = (
-                    load_thread_history(
-                        collection,
-                        thread["thread_id"],
-                    )
-                )
-
-                st.rerun()
-
-    else:
-
-        st.caption(
-            "No past threads yet."
-        )
-
-
-    # ========================================================
-    # SEARCH
-    # ========================================================
-
-    st.divider()
-
-    st.header(
-        "🔎 Search Past Translations"
-    )
-
-    query = st.text_input(
-        "Search by meaning"
-    )
-
-    if (
-        query
-        and collection.count() > 0
-    ):
-
-        res = collection.query(
-
-            query_texts=[query],
-
-            n_results=min(
-                5,
-                collection.count(),
-            ),
-        )
-
-        for doc, meta, dist in zip(
-
-            res["documents"][0],
-
-            res["metadatas"][0],
-
-            res["distances"][0],
+        if st.button(
+            f"💬 {title}\n🕒 {date}",
+            key=f"past_{thread['thread_id']}",
+            use_container_width=True,
         ):
+            st.session_state.thread_id = thread["thread_id"]
+            st.session_state.messages = load_thread(thread["thread_id"])
+            st.rerun()
 
+    st.divider()
+    st.header("🔎 Search Past Translations")
+
+    query = st.text_input("Search by meaning")
+
+    if query and translation_memory.count() > 0:
+        results = translation_memory.query(
+            query_texts=[query],
+            n_results=min(5, translation_memory.count()),
+        )
+
+        for document, metadata, distance in zip(
+            results["documents"][0],
+            results["metadatas"][0],
+            results["distances"][0],
+        ):
             st.markdown(
-
-                f"**{doc}**  \n"
-                f"→ {meta['tgt_lang']}: "
-                f"{meta['translation']}  \n"
-                f"<small>"
-                f"similarity "
-                f"{1 - dist:.2f}"
-                f"</small>",
-
+                f"**{document}**  \n"
+                f"→ {metadata['tgt_lang']}: {metadata['translation']}  \n"
+                f"<small>similarity {1-distance:.2f}</small>",
                 unsafe_allow_html=True,
             )
 
-            st.divider()
+    st.caption(f"Translation memory: {translation_memory.count()}")
+    st.caption(f"Chat messages: {chat_history.count()}")
+    st.caption(f"Device: {DEVICE.upper()}")
 
-
-# ============================================================
-# CHAT HISTORY
-# ============================================================
-
-for i, msg in enumerate(
-    st.session_state.messages
-):
-
-    with st.chat_message(
-        msg["role"]
-    ):
-
-        st.markdown(
-
-            msg["content"],
-
-            unsafe_allow_html=True,
-        )
-
-        if "download" in msg:
-
-            st.download_button(
-
-                "⬇️ Download translation",
-
-                data=
-                    msg["download"]["data"],
-
-                file_name=
-                    msg["download"]["name"],
-
-                key=f"dl_{i}",
-            )
-
-
-# ============================================================
-# NEW INPUT
-# ============================================================
+for message in st.session_state.messages:
+    with st.chat_message(message["role"]):
+        st.markdown(message["content"], unsafe_allow_html=True)
 
 prompt = st.chat_input(
-
-    f"Type in {src_lang} "
-    f"or drop a file "
-    f"(.txt, .pdf, .docx)...",
-
+    f"Type in {src_lang} or drop a file (.txt, .pdf, .docx)...",
     accept_file="multiple",
-
-    file_type=[
-        "txt",
-        "pdf",
-        "docx",
-    ],
+    file_type=["txt", "pdf", "docx"],
 )
 
-
 if prompt:
-
-    text = (
-        prompt.text or ""
-    ).strip()
-
-    files = (
-        prompt.files or []
-    )
-
+    text = (prompt.text or "").strip()
+    files = prompt.files or []
     new_messages = []
 
-
-    # ========================================================
-    # SAME LANGUAGE CHECK
-    # ========================================================
-
     if src_lang == tgt_lang:
-
-        with st.chat_message(
-            "assistant"
-        ):
-
-            st.warning(
-
-                "Source and target "
-                "languages are the same. "
-                "Please change one "
-                "in the sidebar."
-            )
-
-
+        with st.chat_message("assistant"):
+            st.warning("Source and target languages are the same. Please select different languages.")
     else:
-
-        # ====================================================
-        # TEXT
-        # ====================================================
-
         if text:
-
-            with st.chat_message(
-                "user"
-            ):
-
+            with st.chat_message("user"):
                 st.markdown(text)
 
+            with st.chat_message("assistant"):
+                reply = handle_text(text, src_lang, tgt_lang, tokenizer, model)
+                st.markdown(reply["content"], unsafe_allow_html=True)
 
-            with st.chat_message(
-                "assistant"
-            ):
-
-                reply = handle_text(
-
-                    text,
-
-                    src_lang,
-
-                    tgt_lang,
-
-                    tokenizer,
-
-                    model,
-
-                    collection,
-
-                    st.session_state.thread_id,
-                )
-
-
-                st.markdown(
-
-                    reply["content"],
-
-                    unsafe_allow_html=True,
-                )
-
-
-            new_messages += [
-
-                {
-                    "role": "user",
-
-                    "content": text,
-                },
-
+            new_messages.extend([
+                {"role": "user", "content": text},
                 reply,
-            ]
+            ])
 
+        for uploaded_file in files:
+            with st.chat_message("user"):
+                st.markdown(f"📎 {uploaded_file.name}")
 
-        # ====================================================
-        # FILES
-        # ====================================================
-
-        for f in files:
-
-            with st.chat_message(
-                "user"
-            ):
-
-                st.markdown(
-                    f"📎 {f.name}"
-                )
-
-
-            with st.chat_message(
-                "assistant"
-            ):
-
+            with st.chat_message("assistant"):
                 reply = handle_file(
-
-                    f,
-
-                    src_lang,
-
-                    tgt_lang,
-
-                    tokenizer,
-
-                    model,
-
-                    collection,
-
-                    st.session_state.thread_id,
+                    uploaded_file, src_lang, tgt_lang, tokenizer, model
                 )
-
-
-                st.markdown(
-
-                    reply["content"],
-
-                    unsafe_allow_html=True,
-                )
-
+                st.markdown(reply["content"], unsafe_allow_html=True)
 
                 if "download" in reply:
-
                     st.download_button(
-
                         "⬇️ Download translation",
-
-                        data=
-                            reply["download"]["data"],
-
-                        file_name=
-                            reply["download"]["name"],
-
-                        key=
-                            f"new_dl_"
-                            f"{uuid.uuid4()}",
+                        data=reply["download"]["data"],
+                        file_name=reply["download"]["name"],
+                        key=f"download_{uuid.uuid4()}",
                     )
 
-
-            new_messages += [
-
-                {
-                    "role": "user",
-
-                    "content":
-                        f"📎 {f.name}",
-                },
-
+            new_messages.extend([
+                {"role": "user", "content": f"📎 {uploaded_file.name}"},
                 reply,
-            ]
+            ])
 
-
-        # ====================================================
-        # SAVE CURRENT THREAD IN SESSION
-        # ====================================================
-
-        st.session_state.messages.extend(
-            new_messages
-        )
-
+        st.session_state.messages.extend(new_messages)
         st.rerun()
