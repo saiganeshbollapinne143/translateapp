@@ -34,7 +34,6 @@ st.markdown("""
 def load_model():
     device = "cuda" if torch.cuda.is_available() else "cpu"
 
-    # Automatically uses os.environ["HF_TOKEN"]
     tokenizer = AutoTokenizer.from_pretrained(MODEL)
     model = AutoModelForSeq2SeqLM.from_pretrained(
         MODEL,
@@ -52,9 +51,9 @@ def get_db():
     client = chromadb.PersistentClient(path="chroma_db")
     return client.get_or_create_collection("translation_history")
 
-# ================= THREAD ID =================
+# ================= THREAD ID (AUTOMATIC GENERATION) =================
 if "thread_id" not in st.session_state:
-    st.session_state.thread_id = 307
+    st.session_state.thread_id = str(uuid.uuid4())[:8]
 
 # ================= FILE READER =================
 def read_file(file):
@@ -81,8 +80,7 @@ def translate(text, source, target):
     else:
         target_id = tokenizer.convert_tokens_to_ids(target)
 
-    # 150-char chunking to avoid RAM spikes on Streamlit Cloud CPU
-   # Change chunking length from 150 to 600
+    # Chunking text to avoid RAM/VRAM overflow
     chunks = [text[i:i+1200] for i in range(0, len(text), 1200)]
     results = []
     
@@ -114,7 +112,7 @@ def translate(text, source, target):
 
     progress_bar.empty()
 
-    # Aggressive memory cleanup
+    # Memory cleanup
     del inputs, output
     gc.collect()
     if torch.cuda.is_available():
@@ -172,7 +170,7 @@ def show_history(search=""):
         thread = meta.get("thread", "Legacy")
         time = meta.get("time", "Unknown")
 
-        with st.expander(f"🌐 {source} → {target} • Thread {thread} • {time}"):
+        with st.expander(f"🌐 {source} → {target} | Thread: {thread} | {time}"):
             st.caption(f"🧵 Thread ID: `{thread}`")
             c1, c2 = st.columns(2)
             with c1:
@@ -238,7 +236,7 @@ with c1:
     st.code(str(st.session_state.thread_id))
 with c2:
     if st.button("＋ New Thread", use_container_width=True):
-        st.session_state.thread_id += 1
+        st.session_state.thread_id = str(uuid.uuid4())[:8]
         st.rerun()
 
 st.divider()
