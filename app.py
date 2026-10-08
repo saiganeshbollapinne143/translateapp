@@ -82,7 +82,8 @@ def translate(text, source, target):
         target_id = tokenizer.convert_tokens_to_ids(target)
 
     # 150-char chunking to avoid RAM spikes on Streamlit Cloud CPU
-    chunks = [text[i:i+150] for i in range(0, len(text), 150)]
+   # Change chunking length from 150 to 600
+    chunks = [text[i:i+600] for i in range(0, len(text), 600)]
     results = []
     
     progress_bar = st.progress(0)
