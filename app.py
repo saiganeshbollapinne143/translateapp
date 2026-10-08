@@ -85,7 +85,7 @@ def translate(text, source, target):
             output = model.generate(
                 **inputs,
                 forced_bos_token_id=target_id,
-                max_new_tokens=800,
+                max_new_tokens=512,
                 num_beams=1,
                 do_sample=False
             )
