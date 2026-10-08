@@ -1,9 +1,15 @@
 import csv
+import html
 import io
+import json
+import re
+import uuid
+import zipfile
 import importlib.metadata as md
 import urllib.request
-import uuid
+import xml.etree.ElementTree as ET
 from datetime import datetime
+from html.parser import HTMLParser
 from pathlib import Path
 
 import streamlit as st
@@ -60,6 +66,18 @@ FONT_BASE_URLS = [
     "https://github.com/notofonts/notofonts.github.io/raw/main/fonts",
 ]
 
+# Every file extension the uploader accepts.
+# Plain-text style files are all read the same way (see extract_text).
+TEXT_LIKE = [
+    "txt", "md", "markdown", "log", "rst", "ini", "cfg", "conf",
+    "yaml", "yml", "toml", "srt", "vtt", "tex",
+]
+INPUT_EXTENSIONS = TEXT_LIKE + [
+    "pdf", "docx", "csv", "tsv", "json", "html", "htm", "xml",
+    "rtf", "xlsx", "xlsm", "pptx", "odt", "ods", "odp",
+    "png", "jpg", "jpeg", "bmp", "tiff", "webp",
+]
+
 
 # =========================================================
 # LOAD CHROMADB
@@ -101,37 +119,244 @@ if "thread_id" not in st.session_state:
 
 
 # =========================================================
-# FILE EXTRACTION
+# FILE EXTRACTION (INPUT)
 # =========================================================
+
+def decode_bytes(data):
+
+    for encoding in ("utf-8-sig", "utf-16", "cp1252", "latin-1"):
+
+        try:
+            return data.decode(encoding)
+        except (UnicodeDecodeError, UnicodeError):
+            continue
+
+    return data.decode("utf-8", errors="ignore")
+
+
+class _TextCollector(HTMLParser):
+    """Collects visible text from HTML / XML."""
+
+    SKIP = {"script", "style", "head"}
+    BLOCK = {
+        "p", "div", "br", "li", "tr", "h1", "h2", "h3",
+        "h4", "h5", "h6", "section", "article", "table",
+    }
+
+    def __init__(self):
+        super().__init__()
+        self.parts = []
+        self._skip_depth = 0
+
+    def handle_starttag(self, tag, attrs):
+        if tag in self.SKIP:
+            self._skip_depth += 1
+        if tag in self.BLOCK:
+            self.parts.append("\n")
+
+    def handle_endtag(self, tag):
+        if tag in self.SKIP and self._skip_depth:
+            self._skip_depth -= 1
+        if tag in self.BLOCK:
+            self.parts.append("\n")
+
+    def handle_data(self, data):
+        if not self._skip_depth:
+            self.parts.append(data)
+
+
+def markup_to_text(raw):
+
+    parser = _TextCollector()
+    parser.feed(raw)
+
+    lines = [
+        line.strip()
+        for line in "".join(parser.parts).splitlines()
+    ]
+
+    return "\n".join(line for line in lines if line)
+
+
+def rtf_to_text(raw):
+
+    raw = re.sub(
+        r"\\'([0-9a-fA-F]{2})",
+        lambda m: bytes.fromhex(m.group(1)).decode(
+            "cp1252", errors="ignore"
+        ),
+        raw,
+    )
+    raw = re.sub(
+        r"\\u(-?\d+)\??",
+        lambda m: chr(int(m.group(1)) % 65536),
+        raw,
+    )
+    raw = re.sub(r"\\par[d]?", "\n", raw)
+    raw = re.sub(r"\\[a-zA-Z]+-?\d* ?", "", raw)
+    raw = re.sub(r"[{}]", "", raw)
+
+    return raw.strip()
+
+
+def json_strings(node, out):
+    """Collect every string value from any JSON structure."""
+
+    if isinstance(node, str):
+        if node.strip():
+            out.append(node)
+
+    elif isinstance(node, dict):
+        for value in node.values():
+            json_strings(value, out)
+
+    elif isinstance(node, list):
+        for item in node:
+            json_strings(item, out)
+
 
 def extract_text(file):
 
     name = file.name.lower()
+    ext = name.rsplit(".", 1)[-1] if "." in name else ""
+    data = file.getvalue()
 
-    if name.endswith(".txt"):
-        return file.read().decode(
-            "utf-8",
-            errors="ignore"
-        )
+    # ---- PDF ----
+    if ext == "pdf":
 
-    if name.endswith(".pdf"):
-        reader = PdfReader(file)
+        reader = PdfReader(io.BytesIO(data))
 
         return "\n".join(
             page.extract_text() or ""
             for page in reader.pages
         )
 
-    if name.endswith(".docx"):
+    # ---- Word ----
+    if ext == "docx":
 
-        doc = Document(file)
+        doc = Document(io.BytesIO(data))
 
-        return "\n".join(
-            paragraph.text
-            for paragraph in doc.paragraphs
+        lines = [p.text for p in doc.paragraphs]
+
+        for table in doc.tables:
+            for row in table.rows:
+                cells = [c.text.strip() for c in row.cells]
+                lines.append(" | ".join(c for c in cells if c))
+
+        return "\n".join(lines)
+
+    # ---- CSV / TSV ----
+    if ext in ("csv", "tsv"):
+
+        text = decode_bytes(data)
+        delimiter = "\t" if ext == "tsv" else ","
+
+        rows = csv.reader(
+            io.StringIO(text),
+            delimiter=delimiter,
         )
 
-    return ""
+        return "\n".join(
+            " | ".join(cell.strip() for cell in row if cell.strip())
+            for row in rows
+            if any(cell.strip() for cell in row)
+        )
+
+    # ---- JSON ----
+    if ext == "json":
+
+        text = decode_bytes(data)
+
+        try:
+            strings = []
+            json_strings(json.loads(text), strings)
+            return "\n".join(strings)
+
+        except json.JSONDecodeError:
+            return text
+
+    # ---- HTML / XML ----
+    if ext in ("html", "htm", "xml"):
+        return markup_to_text(decode_bytes(data))
+
+    # ---- RTF ----
+    if ext == "rtf":
+        return rtf_to_text(decode_bytes(data))
+
+    # ---- Excel ----
+    if ext in ("xlsx", "xlsm"):
+
+        sheets = pd.read_excel(
+            io.BytesIO(data),
+            sheet_name=None,
+            header=None,
+            dtype=str,
+        )
+
+        lines = []
+
+        for frame in sheets.values():
+            for row in frame.fillna("").values.tolist():
+                cells = [str(c).strip() for c in row if str(c).strip()]
+                if cells:
+                    lines.append(" | ".join(cells))
+
+        return "\n".join(lines)
+
+    # ---- PowerPoint ----
+    if ext == "pptx":
+
+        from pptx import Presentation
+
+        prs = Presentation(io.BytesIO(data))
+        lines = []
+
+        for slide in prs.slides:
+            for shape in slide.shapes:
+
+                if shape.has_text_frame:
+                    for paragraph in shape.text_frame.paragraphs:
+                        text = "".join(r.text for r in paragraph.runs)
+                        if text.strip():
+                            lines.append(text)
+
+                if getattr(shape, "has_table", False) and shape.has_table:
+                    for row in shape.table.rows:
+                        cells = [c.text.strip() for c in row.cells]
+                        lines.append(" | ".join(c for c in cells if c))
+
+        return "\n".join(lines)
+
+    # ---- OpenDocument (odt / ods / odp) ----
+    if ext in ("odt", "ods", "odp"):
+
+        with zipfile.ZipFile(io.BytesIO(data)) as archive:
+            raw = archive.read("content.xml").decode("utf-8", errors="ignore")
+
+        raw = re.sub(r"</text:(p|h)>|<text:line-break/>", "\n", raw)
+        raw = re.sub(r"<[^>]+>", "", raw)
+
+        return html.unescape(raw).strip()
+
+    # ---- Images (needs OCR) ----
+    if ext in ("png", "jpg", "jpeg", "bmp", "tiff", "webp"):
+
+        try:
+            import pytesseract
+            from PIL import Image
+
+        except ImportError:
+            raise RuntimeError(
+                "Image input needs OCR. Install: pip install pytesseract pillow "
+                "and install the Tesseract OCR program."
+            )
+
+        return pytesseract.image_to_string(
+            Image.open(io.BytesIO(data))
+        )
+
+    # ---- Anything else: plain text ----
+    return decode_bytes(data)
 
 
 # =========================================================
@@ -178,11 +403,12 @@ def split_text(text, size=700):
 # =========================================================
 
 def translate(text, source_code, target_code):
+    """Returns (translated_text, [(source_chunk, translated_chunk), ...])."""
 
     chunks = split_text(text)
 
     if not chunks:
-        return ""
+        return "", []
 
     results = []
 
@@ -232,7 +458,7 @@ def translate(text, source_code, target_code):
     progress.empty()
     status.success("Translation completed!")
 
-    return "\n\n".join(results)
+    return "\n\n".join(results), list(zip(chunks, results))
 
 
 # =========================================================
@@ -267,10 +493,273 @@ def save_record(
 
 
 # =========================================================
-# CREATE PDF
+# OUTPUT BUILDERS
+# Each builder takes a context dict:
+#   text, pairs, source_language, target_language,
+#   source_text, timestamp
+# and returns bytes.
 # =========================================================
 
-def create_pdf(text, language):
+_CONTROL_CHARS = re.compile(r"[\x00-\x08\x0b\x0c\x0e-\x1f]")
+
+
+def clean(value):
+    return _CONTROL_CHARS.sub("", value or "")
+
+
+def create_txt(ctx):
+    return ctx["text"].encode("utf-8")
+
+
+def create_md(ctx):
+
+    return (
+        f"# Translation: {ctx['source_language']} → "
+        f"{ctx['target_language']}\n\n"
+        f"_Generated {ctx['timestamp']}_\n\n"
+        + ctx["text"].replace("\n\n", "\n\n")
+    ).encode("utf-8")
+
+
+def create_html(ctx):
+
+    paragraphs = "\n".join(
+        f"<p>{html.escape(p)}</p>"
+        for p in ctx["text"].split("\n\n")
+        if p.strip()
+    )
+
+    page = f"""<!DOCTYPE html>
+<html lang="en">
+<head>
+<meta charset="utf-8">
+<title>Translation: {html.escape(ctx['source_language'])} to {html.escape(ctx['target_language'])}</title>
+<style>
+body {{ font-family: 'Noto Sans', 'Noto Sans Tamil', 'Noto Sans Devanagari',
+       'Noto Sans Telugu', 'Noto Sans Kannada', 'Noto Sans Malayalam',
+       Arial, sans-serif; max-width: 800px; margin: 2rem auto; line-height: 1.7; }}
+.meta {{ color: #666; font-size: 0.9rem; }}
+</style>
+</head>
+<body>
+<h1>{html.escape(ctx['source_language'])} → {html.escape(ctx['target_language'])}</h1>
+<p class="meta">Generated {html.escape(ctx['timestamp'])}</p>
+{paragraphs}
+</body>
+</html>
+"""
+    return page.encode("utf-8")
+
+
+def create_csv(ctx):
+
+    buffer = io.StringIO()
+    writer = csv.writer(buffer)
+
+    writer.writerow(
+        [
+            "segment",
+            "source_language",
+            "target_language",
+            "source_text",
+            "translated_text",
+        ]
+    )
+
+    for i, (src, tr) in enumerate(ctx["pairs"], 1):
+        writer.writerow(
+            [
+                i,
+                ctx["source_language"],
+                ctx["target_language"],
+                src,
+                tr,
+            ]
+        )
+
+    # utf-8-sig so Excel opens Indian scripts correctly
+    return buffer.getvalue().encode("utf-8-sig")
+
+
+def create_json(ctx):
+
+    payload = {
+        "source_language": ctx["source_language"],
+        "target_language": ctx["target_language"],
+        "timestamp": ctx["timestamp"],
+        "source_text": ctx["source_text"],
+        "translated_text": ctx["text"],
+        "segments": [
+            {
+                "index": i,
+                "source": src,
+                "translation": tr,
+            }
+            for i, (src, tr) in enumerate(ctx["pairs"], 1)
+        ],
+    }
+
+    return json.dumps(
+        payload,
+        ensure_ascii=False,
+        indent=2,
+    ).encode("utf-8")
+
+
+def create_xml(ctx):
+
+    root = ET.Element(
+        "translation",
+        source_language=ctx["source_language"],
+        target_language=ctx["target_language"],
+        timestamp=ctx["timestamp"],
+    )
+
+    for i, (src, tr) in enumerate(ctx["pairs"], 1):
+
+        segment = ET.SubElement(root, "segment", index=str(i))
+        ET.SubElement(segment, "source").text = src
+        ET.SubElement(segment, "target").text = tr
+
+    ET.indent(root)
+
+    return ET.tostring(
+        root,
+        encoding="utf-8",
+        xml_declaration=True,
+    )
+
+
+def _rtf_escape(value):
+
+    out = []
+
+    for ch in value:
+
+        code = ord(ch)
+
+        if ch in "\\{}":
+            out.append("\\" + ch)
+
+        elif ch == "\n":
+            out.append("\\par\n")
+
+        elif code < 128:
+            out.append(ch)
+
+        else:
+
+            units = [code]
+
+            if code > 0xFFFF:
+                code -= 0x10000
+                units = [
+                    0xD800 + (code >> 10),
+                    0xDC00 + (code & 0x3FF),
+                ]
+
+            for unit in units:
+                signed = unit - 65536 if unit > 32767 else unit
+                out.append(f"\\u{signed}?")
+
+    return "".join(out)
+
+
+def create_rtf(ctx):
+
+    body = _rtf_escape(ctx["text"])
+
+    return (
+        "{\\rtf1\\ansi\\deff0\\uc1\n" + body + "\n}"
+    ).encode("ascii")
+
+
+def create_xlsx(ctx):
+
+    frame = pd.DataFrame(
+        [
+            {
+                "Segment": i,
+                "Source Language": ctx["source_language"],
+                "Target Language": ctx["target_language"],
+                "Source Text": src,
+                "Translated Text": tr,
+            }
+            for i, (src, tr) in enumerate(ctx["pairs"], 1)
+        ]
+    )
+
+    output = io.BytesIO()
+
+    with pd.ExcelWriter(output, engine="openpyxl") as writer:
+
+        frame.to_excel(
+            writer,
+            index=False,
+            sheet_name="Translation",
+        )
+
+        sheet = writer.sheets["Translation"]
+
+        for column, width in zip("ABCDE", (10, 18, 18, 60, 60)):
+            sheet.column_dimensions[column].width = width
+
+    return output.getvalue()
+
+
+def create_pptx(ctx):
+
+    from pptx import Presentation
+    from pptx.util import Inches, Pt
+
+    prs = Presentation()
+    prs.slide_width = Inches(13.333)
+    prs.slide_height = Inches(7.5)
+
+    blank = prs.slide_layouts[6]
+
+    for _, translated in ctx["pairs"]:
+
+        slide = prs.slides.add_slide(blank)
+
+        box = slide.shapes.add_textbox(
+            Inches(0.6),
+            Inches(0.5),
+            Inches(12.1),
+            Inches(6.5),
+        )
+
+        frame = box.text_frame
+        frame.word_wrap = True
+        frame.text = translated
+
+        for paragraph in frame.paragraphs:
+            for run in paragraph.runs:
+                run.font.size = Pt(18)
+
+    output = io.BytesIO()
+    prs.save(output)
+
+    return output.getvalue()
+
+
+def create_docx(ctx):
+
+    doc = Document()
+
+    for paragraph in ctx["text"].split("\n"):
+        doc.add_paragraph(paragraph)
+
+    output = io.BytesIO()
+    doc.save(output)
+
+    return output.getvalue()
+
+
+def create_pdf(ctx):
+
+    language = ctx["target_language"]
+    text = ctx["text"]
 
     script_font = SCRIPT_FONTS.get(language)
 
@@ -350,25 +839,71 @@ def create_pdf(text, language):
     return bytes(pdf.output())
 
 
-# =========================================================
-# CREATE DOCX
-# =========================================================
+# (label, extension, mime type, builder)
+OUTPUT_FORMATS = [
+    ("📄 TXT", "txt", "text/plain", create_txt),
+    ("📕 PDF", "pdf", "application/pdf", create_pdf),
+    (
+        "📝 DOCX",
+        "docx",
+        "application/vnd.openxmlformats-officedocument.wordprocessingml.document",
+        create_docx,
+    ),
+    ("📊 CSV", "csv", "text/csv", create_csv),
+    ("🧾 JSON", "json", "application/json", create_json),
+    ("📘 Markdown", "md", "text/markdown", create_md),
+    ("🌐 HTML", "html", "text/html", create_html),
+    ("🧬 XML", "xml", "application/xml", create_xml),
+    ("📃 RTF", "rtf", "application/rtf", create_rtf),
+    (
+        "📗 XLSX",
+        "xlsx",
+        "application/vnd.openxmlformats-officedocument.spreadsheetml.sheet",
+        create_xlsx,
+    ),
+    (
+        "📙 PPTX",
+        "pptx",
+        "application/vnd.openxmlformats-officedocument.presentationml.presentation",
+        create_pptx,
+    ),
+]
 
-def create_docx(text):
 
-    doc = Document()
+def build_all_outputs(translated, pairs, source_text, source_name, target_name):
+    """Build every output format. A failure in one never breaks the others."""
 
-    for paragraph in text.split("\n"):
+    ctx = {
+        "text": clean(translated),
+        "pairs": [(clean(s), clean(t)) for s, t in pairs],
+        "source_text": clean(source_text),
+        "source_language": source_name,
+        "target_language": target_name,
+        "timestamp": datetime.now().strftime("%Y-%m-%d %H:%M:%S"),
+    }
 
-        doc.add_paragraph(
-            paragraph
-        )
+    files = {}
 
-    output = io.BytesIO()
+    for label, ext, mime, builder in OUTPUT_FORMATS:
 
-    doc.save(output)
+        try:
+            data = builder(ctx)
+            files[ext] = {
+                "label": label,
+                "mime": mime,
+                "data": data,
+                "error": None if data else "required font missing",
+            }
 
-    return output.getvalue()
+        except Exception as exc:
+            files[ext] = {
+                "label": label,
+                "mime": mime,
+                "data": None,
+                "error": str(exc),
+            }
+
+    return files
 
 
 # =========================================================
@@ -596,12 +1131,10 @@ if page == "🏠 Translator":
     )
 
     file = st.file_uploader(
-        "Upload TXT, PDF or DOCX",
-        type=[
-            "txt",
-            "pdf",
-            "docx",
-        ],
+        "Upload a file (" + ", ".join(
+            ext.upper() for ext in INPUT_EXTENSIONS[:12]
+        ) + ", ... see Guide for all types)",
+        type=INPUT_EXTENSIONS,
     )
 
     if st.button(
@@ -612,7 +1145,16 @@ if page == "🏠 Translator":
 
         if file:
 
-            text = extract_text(file)
+            try:
+                text = extract_text(file)
+
+            except Exception as exc:
+
+                st.error(
+                    f"Could not read {file.name}: {exc}"
+                )
+
+                st.stop()
 
         if not text.strip():
 
@@ -630,7 +1172,7 @@ if page == "🏠 Translator":
 
             st.stop()
 
-        translated = translate(
+        translated, pairs = translate(
             text,
             LANGUAGES[source_name],
             LANGUAGES[target_name],
@@ -649,13 +1191,12 @@ if page == "🏠 Translator":
 
             "target": target_name,
 
-            "pdf": create_pdf(
+            "files": build_all_outputs(
                 translated,
+                pairs,
+                text,
+                source_name,
                 target_name,
-            ),
-
-            "docx": create_docx(
-                translated
             ),
         }
 
@@ -675,57 +1216,52 @@ if page == "🏠 Translator":
             height=300,
         )
 
-        col1, col2, col3 = st.columns(3)
+        st.subheader(
+            "⬇️ Download as"
+        )
 
-        with col1:
+        files = list(result["files"].items())
 
-            st.download_button(
-                "📄 Download TXT",
-                result["text"],
-                file_name=(
-                    f"translated_"
-                    f"{result['target']}.txt"
-                ),
-                mime="text/plain",
-                use_container_width=True,
-            )
+        for start in range(0, len(files), 4):
 
-        with col2:
+            columns = st.columns(4)
 
-            if result["pdf"]:
+            for column, (ext, info) in zip(
+                columns,
+                files[start:start + 4],
+            ):
 
-                st.download_button(
-                    "📕 Download PDF",
-                    result["pdf"],
-                    file_name=(
-                        f"translated_"
-                        f"{result['target']}.pdf"
-                    ),
-                    mime="application/pdf",
-                    use_container_width=True,
-                )
+                with column:
 
-            else:
+                    if info["data"]:
 
-                st.warning(
-                    "PDF unavailable. "
-                    "Download the required Noto font first."
-                )
+                        st.download_button(
+                            f"{info['label']} (.{ext})",
+                            info["data"],
+                            file_name=(
+                                f"translated_"
+                                f"{result['target']}.{ext}"
+                            ),
+                            mime=info["mime"],
+                            use_container_width=True,
+                        )
 
-        with col3:
+                    else:
 
-            st.download_button(
-                "📝 Download DOCX",
-                result["docx"],
-                file_name=(
-                    f"translated_"
-                    f"{result['target']}.docx"
-                ),
-                mime=(
-                    "application/vnd.openxmlformats-"
-                    "officedocument.wordprocessingml.document"
-                ),
-                use_container_width=True,
+                        st.button(
+                            f"{info['label']} unavailable",
+                            key=f"na_{ext}",
+                            disabled=True,
+                            help=info["error"],
+                            use_container_width=True,
+                        )
+
+        if not result["files"]["pdf"]["data"]:
+
+            st.warning(
+                "PDF unavailable. "
+                "Download the required Noto font first "
+                "(Requirements & Guide page)."
             )
 
 
@@ -871,6 +1407,9 @@ if page == "📚 History":
 
         st.divider()
 
+        all_records = load_records()
+
+        # ---- CSV export ----
         buffer = io.StringIO()
 
         writer = csv.writer(
@@ -888,41 +1427,69 @@ if page == "📚 History":
             ]
         )
 
-        for record in load_records():
+        for record in all_records:
 
             writer.writerow(
                 [
-                    record.get(
-                        "timestamp",
-                        ""
-                    ),
-                    record.get(
-                        "source_language",
-                        ""
-                    ),
-                    record.get(
-                        "target_language",
-                        ""
-                    ),
-                    record.get(
-                        "source_text",
-                        ""
-                    ),
+                    record.get("timestamp", ""),
+                    record.get("source_language", ""),
+                    record.get("target_language", ""),
+                    record.get("source_text", ""),
                     record["translated"],
-                    record.get(
-                        "thread_id",
-                        ""
-                    ),
+                    record.get("thread_id", ""),
                 ]
             )
 
-        st.download_button(
+        # ---- JSON export ----
+        history_json = json.dumps(
+            [
+                {
+                    "timestamp": r.get("timestamp", ""),
+                    "source_language": r.get("source_language", ""),
+                    "target_language": r.get("target_language", ""),
+                    "source_text": r.get("source_text", ""),
+                    "translated_text": r["translated"],
+                    "thread_id": r.get("thread_id", ""),
+                }
+                for r in all_records
+            ],
+            ensure_ascii=False,
+            indent=2,
+        ).encode("utf-8")
+
+        # ---- TXT export ----
+        history_txt = "\n\n".join(
+            f"[{r.get('timestamp', '')}] "
+            f"{r.get('source_language', '?')} → "
+            f"{r.get('target_language', '?')}\n"
+            f"{r.get('source_text', '')}\n---\n{r['translated']}"
+            for r in all_records
+        ).encode("utf-8")
+
+        d1, d2, d3 = st.columns(3)
+
+        d1.download_button(
             "⬇️ Export history (CSV)",
-            buffer.getvalue().encode(
-                "utf-8-sig"
-            ),
+            buffer.getvalue().encode("utf-8-sig"),
             file_name="translation_history.csv",
             mime="text/csv",
+            use_container_width=True,
+        )
+
+        d2.download_button(
+            "⬇️ Export history (JSON)",
+            history_json,
+            file_name="translation_history.json",
+            mime="application/json",
+            use_container_width=True,
+        )
+
+        d3.download_button(
+            "⬇️ Export history (TXT)",
+            history_txt,
+            file_name="translation_history.txt",
+            mime="text/plain",
+            use_container_width=True,
         )
 
         confirm = st.checkbox(
@@ -1118,55 +1685,18 @@ if page == "ℹ️ Requirements & Guide":
 
     packages = [
 
-        (
-            "streamlit",
-            "Web interface"
-        ),
-
-        (
-            "torch",
-            "Runs translation model"
-        ),
-
-        (
-            "transformers",
-            "Loads NLLB-200"
-        ),
-
-        (
-            "sentencepiece",
-            "Tokenizer"
-        ),
-
-        (
-            "chromadb",
-            "Translation history"
-        ),
-
-        (
-            "pypdf",
-            "Reads PDF"
-        ),
-
-        (
-            "python-docx",
-            "Reads and creates DOCX"
-        ),
-
-        (
-            "fpdf2",
-            "Creates PDF"
-        ),
-
-        (
-            "uharfbuzz",
-            "Shapes Indian scripts"
-        ),
-
-        (
-            "pandas",
-            "Usage dashboard"
-        ),
+        ("streamlit", "Web interface"),
+        ("torch", "Runs translation model"),
+        ("transformers", "Loads NLLB-200"),
+        ("sentencepiece", "Tokenizer"),
+        ("chromadb", "Translation history"),
+        ("pypdf", "Reads PDF"),
+        ("python-docx", "Reads and creates DOCX"),
+        ("fpdf2", "Creates PDF"),
+        ("uharfbuzz", "Shapes Indian scripts"),
+        ("pandas", "Usage dashboard, reads Excel"),
+        ("openpyxl", "Reads and creates XLSX"),
+        ("python-pptx", "Reads and creates PPTX"),
     ]
 
     package_rows = []
@@ -1279,8 +1809,14 @@ if page == "ℹ️ Requirements & Guide":
             "pip install streamlit torch "
             "transformers sentencepiece "
             "chromadb pypdf python-docx "
-            "fpdf2 uharfbuzz pandas",
+            "fpdf2 uharfbuzz pandas "
+            "openpyxl python-pptx",
             language="bash",
+        )
+
+        st.caption(
+            "Optional (image input via OCR): "
+            "pip install pytesseract pillow, plus the Tesseract OCR program."
         )
 
     with right:
@@ -1354,7 +1890,7 @@ if page == "ℹ️ Requirements & Guide":
 
         (
             "2️⃣ Add content",
-            "Type text or upload TXT, PDF or DOCX."
+            "Type text or upload any supported file."
         ),
 
         (
@@ -1364,7 +1900,7 @@ if page == "ℹ️ Requirements & Guide":
 
         (
             "4️⃣ Download",
-            "Download TXT, PDF or DOCX."
+            "Pick any format: TXT, PDF, DOCX, CSV, JSON, MD, HTML, XML, RTF, XLSX, PPTX."
         ),
 
     ]
@@ -1397,6 +1933,26 @@ if page == "ℹ️ Requirements & Guide":
     st.write(
         ", ".join(
             LANGUAGES.keys()
+        )
+    )
+
+    st.subheader(
+        "Supported input files"
+    )
+
+    st.write(
+        ", ".join(
+            f".{ext}" for ext in INPUT_EXTENSIONS
+        )
+    )
+
+    st.subheader(
+        "Supported output files"
+    )
+
+    st.write(
+        ", ".join(
+            f".{ext}" for _, ext, _, _ in OUTPUT_FORMATS
         )
     )
 
