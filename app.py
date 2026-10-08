@@ -63,12 +63,12 @@ def translate(text, source, target):
     tokenizer, model, device = load_model()
     
     tokenizer.src_lang = source
-    try:
+    if hasattr(tokenizer, "lang_code_to_id") and target in tokenizer.lang_code_to_id:
         target_id = tokenizer.lang_code_to_id[target]
-    except (KeyError, AttributeError):
+    else:
         target_id = tokenizer.convert_tokens_to_ids(target)
 
-    chunks = [text[i:i+600] for i in range(0, len(text), 600)]
+    chunks = [text[i:i+300] for i in range(0, len(text), 300)]
     results = []
     
     progress_bar = st.progress(0)
@@ -89,7 +89,7 @@ def translate(text, source, target):
             output = model.generate(
                 **inputs,
                 forced_bos_token_id=target_id,
-                max_new_tokens=512,
+                max_new_tokens=256,
                 num_beams=1,
                 do_sample=False
             )
@@ -151,7 +151,7 @@ def show_history(search=""):
         source = meta.get("source", "Unknown")
         target = meta.get("target", "Unknown")
         original = meta.get("original", "")
-        thread = meta.get("thread", "Previous Session")
+        thread = meta.get("thread", "Legacy")
         time = meta.get("time", "Unknown")
 
         with st.expander(f"🌐 {source} → {target} • Thread {thread} • {time}"):
@@ -184,7 +184,6 @@ source_name = c1.selectbox("Source Language", list(LANG.keys()))
 target_name = c2.selectbox("Target Language", list(LANG.keys()), index=1)
 
 # ================= INPUT SECTION =================
-# Text Area stays empty unless typed directly
 input_text = st.text_area(
     "Text to translate",
     height=160,
@@ -198,7 +197,6 @@ if uploaded:
 
 # ================= TRANSLATE BUTTON =================
 if st.button("🚀 Translate", type="primary", use_container_width=True):
-    # Determine input source: file prioritized if uploaded, otherwise text box
     source_text = ""
     if uploaded:
         source_text = read_file(uploaded)
@@ -210,22 +208,25 @@ if st.button("🚀 Translate", type="primary", use_container_width=True):
     elif source_name == target_name:
         st.warning("Please select different source and target languages.")
     else:
-        with st.spinner("Translating..."):
-            result = translate(source_text, LANG[source_name], LANG[target_name])
+        try:
+            with st.spinner("Translating..."):
+                result = translate(source_text, LANG[source_name], LANG[target_name])
 
-        save_history(source_name, target_name, source_text, result)
+            save_history(source_name, target_name, source_text, result)
 
-        st.success("✅ Translation completed.")
-        st.subheader("Translation Result")
-        st.text_area("Result Output", result, height=250)
+            st.success("✅ Translation completed.")
+            st.subheader("Translation Result")
+            st.text_area("Result Output", result, height=250)
 
-        st.download_button(
-            "📥 Download Translation",
-            result,
-            "translation.txt",
-            "text/plain",
-            use_container_width=True
-        )
+            st.download_button(
+                "📥 Download Translation",
+                result,
+                "translation.txt",
+                "text/plain",
+                use_container_width=True
+            )
+        except Exception as e:
+            st.error(f"Translation Error: {str(e)}")
 
 # ================= CURRENT THREAD =================
 st.divider()
