@@ -303,27 +303,19 @@ if st.button(
             )
 
 # ================= CURRENT THREAD =================
-with st.expander("🧵 Current Session", expanded=True):
+if "thread_id" not in st.session_state:
+    st.session_state.thread_id = 306
 
-    c1, c2, c3 = st.columns([2, 5, 2])
+c1, c2 = st.columns([5, 1])
 
-    with c1:
-        st.metric(
-            "History",
-            get_db().count()
-        )
+with c1:
+    st.write("🧵 **Thread ID:**")
+    st.code(st.session_state.thread_id)
 
-    with c2:
-        st.write(
-            f"**Thread ID:** `{get_thread()}`"
-        )
-
-    with c3:
-        if st.button(
-            "＋ New Thread",
-            use_container_width=True
-        ):
-            new_thread()
+with c2:
+    if st.button("＋ New Thread", key="new_thread", use_container_width=True):
+        st.session_state.thread_id += 1
+        st.rerun()
 
 # ================= HISTORY =================
 st.divider()
