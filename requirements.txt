@@ -9,3 +9,4 @@ sentencepiece
 fpdf2
 uharfbuzz
 chromadb
+torchvision
