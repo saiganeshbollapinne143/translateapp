@@ -39,7 +39,7 @@ def translate(text,src,tgt):
     tokenizer,model=load_model()
     tokenizer.src_lang=src
     target_id=tokenizer.convert_tokens_to_ids(tgt)
-    parts=[text[i:i+500] for i in range(0,len(text),500)]
+    parts=[text[i:i+1200] for i in range(0,len(text),1200)]
     result=[]
     bar=st.progress(0)
 
