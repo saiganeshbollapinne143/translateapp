@@ -1,5 +1,3 @@
-import os
-import uuid
 import streamlit as st
 import torch
 from io import BytesIO
@@ -12,7 +10,7 @@ from reportlab.lib.pagesizes import A4
 # ---------------- CONFIG ----------------
 st.set_page_config(page_title="AI Translator", page_icon="🌐")
 
-MODEL_NAME = "facebook/nllb-200-distilled-600M"
+MODEL = "facebook/nllb-200-distilled-600M"
 DEVICE = "cuda" if torch.cuda.is_available() else "cpu"
 
 LANGUAGES = {
@@ -31,41 +29,35 @@ LANGUAGES = {
 # ---------------- LOAD MODEL ----------------
 @st.cache_resource
 def load_model():
-    tokenizer = AutoTokenizer.from_pretrained(MODEL_NAME)
-    model = AutoModelForSeq2SeqLM.from_pretrained(MODEL_NAME)
+    tokenizer = AutoTokenizer.from_pretrained(MODEL)
+    model = AutoModelForSeq2SeqLM.from_pretrained(MODEL)
     model.to(DEVICE)
     model.eval()
     return tokenizer, model
 
 tokenizer, model = load_model()
 
-# ---------------- SESSION ----------------
-if "thread_id" not in st.session_state:
-    st.session_state.thread_id = str(uuid.uuid4())
-
-if "messages" not in st.session_state:
-    st.session_state.messages = []
-
-# ---------------- TEXT EXTRACTION ----------------
+# ---------------- EXTRACT TEXT ----------------
 def extract_text(file):
-    if file.name.lower().endswith(".txt"):
+    name = file.name.lower()
+
+    if name.endswith(".txt"):
         return file.read().decode("utf-8", errors="ignore")
 
-    if file.name.lower().endswith(".pdf"):
+    if name.endswith(".pdf"):
         reader = PdfReader(file)
         return "\n".join(page.extract_text() or "" for page in reader.pages)
 
-    if file.name.lower().endswith(".docx"):
+    if name.endswith(".docx"):
         doc = Document(file)
         return "\n".join(p.text for p in doc.paragraphs)
 
     return ""
 
-# ---------------- CHUNK TEXT ----------------
-def split_text(text, size=500):
+# ---------------- SPLIT TEXT ----------------
+def split_text(text, size=800):
     words = text.split()
-    chunks = []
-    current = ""
+    chunks, current = [], ""
 
     for word in words:
         if len(current) + len(word) + 1 <= size:
@@ -81,7 +73,8 @@ def split_text(text, size=500):
     return chunks
 
 # ---------------- TRANSLATE ----------------
-def translate_text(text, target_language):
+def translate(text, source_code, target_code):
+
     chunks = split_text(text)
 
     results = []
@@ -89,10 +82,12 @@ def translate_text(text, target_language):
     progress = st.progress(0)
     status = st.empty()
 
-    for i, chunk in enumerate(chunks):
-        status.write(f"Translating {i + 1} / {len(chunks)}...")
+    tokenizer.src_lang = source_code
+    target_id = tokenizer.convert_tokens_to_ids(target_code)
 
-        tokenizer.src_lang = "eng_Latn"
+    for i, chunk in enumerate(chunks):
+
+        status.write(f"Translating {i + 1} / {len(chunks)}...")
 
         inputs = tokenizer(
             chunk,
@@ -101,33 +96,32 @@ def translate_text(text, target_language):
             max_length=256
         ).to(DEVICE)
 
-        target_id = tokenizer.convert_tokens_to_ids(target_language)
-
         with torch.no_grad():
             output = model.generate(
                 **inputs,
                 forced_bos_token_id=target_id,
-                max_new_tokens=256,
-                num_beams=1
+                max_new_tokens=128,
+                num_beams=1,
+                do_sample=False
             )
 
-        translated = tokenizer.batch_decode(
+        result = tokenizer.batch_decode(
             output,
             skip_special_tokens=True
         )[0]
 
-        results.append(translated)
+        results.append(result)
+
         progress.progress((i + 1) / len(chunks))
 
-    status.empty()
-    progress.empty()
+    status.success("Translation completed!")
 
     return "\n\n".join(results)
 
-# ---------------- CREATE PDF ----------------
-def create_pdf(text):
-    buffer = BytesIO()
+# ---------------- PDF ----------------
+def make_pdf(text):
 
+    buffer = BytesIO()
     pdf = canvas.Canvas(buffer, pagesize=A4)
 
     width, height = A4
@@ -137,14 +131,17 @@ def create_pdf(text):
     pdf.setFont("Helvetica", 10)
 
     for paragraph in text.split("\n"):
+
         words = paragraph.split()
         line = ""
 
         for word in words:
-            test_line = line + " " + word if line else word
 
-            if pdf.stringWidth(test_line, "Helvetica", 10) < width - 2 * margin:
-                line = test_line
+            test = line + " " + word if line else word
+
+            if pdf.stringWidth(test, "Helvetica", 10) < width - 80:
+                line = test
+
             else:
                 pdf.drawString(margin, y, line)
                 y -= 15
@@ -171,112 +168,71 @@ def create_pdf(text):
 
     return buffer
 
-# ---------------- SIDEBAR ----------------
-st.sidebar.title("🌐 AI Translator")
-
-st.sidebar.write("Thread ID:")
-st.sidebar.code(st.session_state.thread_id)
-
-if st.sidebar.button("🆕 New Conversation"):
-    st.session_state.thread_id = str(uuid.uuid4())
-    st.session_state.messages = []
-    st.rerun()
-
-# ---------------- MAIN UI ----------------
+# ---------------- UI ----------------
 st.title("🌐 AI Document Translator")
 
-st.write(
-    "Translate English text or documents into multiple languages "
-    "using NLLB-200."
-)
+st.write("Translate text or documents using NLLB-200.")
 
-source_language = st.selectbox(
-    "Source Language",
-    list(LANGUAGES.keys()),
-    index=0
-)
+col1, col2 = st.columns(2)
 
-target_language = st.selectbox(
-    "Target Language",
-    list(LANGUAGES.keys()),
-    index=1
-)
+with col1:
+    source = st.selectbox(
+        "Source Language",
+        list(LANGUAGES.keys())
+    )
 
-input_text = st.text_area(
+with col2:
+    target = st.selectbox(
+        "Target Language",
+        list(LANGUAGES.keys()),
+        index=1
+    )
+
+text = st.text_area(
     "Enter text",
-    height=180,
-    placeholder="Enter English text here..."
+    height=180
 )
 
-uploaded_file = st.file_uploader(
-    "Or upload TXT, PDF, or DOCX",
+file = st.file_uploader(
+    "Upload TXT, PDF or DOCX",
     type=["txt", "pdf", "docx"]
 )
 
-# ---------------- TRANSLATE BUTTON ----------------
 if st.button("🔄 Translate", type="primary"):
 
-    if uploaded_file:
-        text = extract_text(uploaded_file)
-    else:
-        text = input_text
+    if file:
+        text = extract_text(file)
 
     if not text.strip():
         st.warning("Please enter text or upload a document.")
         st.stop()
 
-    target_code = LANGUAGES[target_language]
-
-    st.info(f"Translating to {target_language}...")
-
-    translated_text = translate_text(
+    translated = translate(
         text,
-        target_code
+        LANGUAGES[source],
+        LANGUAGES[target]
     )
-
-    st.session_state.messages.append({
-        "source": text,
-        "translation": translated_text,
-        "target": target_language
-    })
-
-    st.success("Translation completed!")
 
     st.subheader("Translated Text")
 
     st.text_area(
         "Result",
-        translated_text,
+        translated,
         height=300
     )
 
-    # ---------------- DOWNLOAD TXT ----------------
     st.download_button(
         "📄 Download TXT",
-        translated_text,
-        file_name=f"translated_{target_language}.txt",
+        translated,
+        file_name=f"translated_{target}.txt",
         mime="text/plain"
     )
 
-    # ---------------- DOWNLOAD PDF ----------------
-    pdf_file = create_pdf(translated_text)
+    pdf = make_pdf(translated)
 
     st.download_button(
         "📕 Download Translated PDF",
-        pdf_file,
-        file_name=f"translated_{target_language}.pdf",
+        pdf,
+        file_name=f"translated_{target}.pdf",
         mime="application/pdf"
     )
-
-# ---------------- HISTORY ----------------
-if st.session_state.messages:
-
-    st.sidebar.subheader("📜 Current Conversation")
-
-    for i, msg in enumerate(
-        reversed(st.session_state.messages),
-        1
-    ):
-        st.sidebar.write(
-            f"{i}. {msg['target']} translation"
-        )
