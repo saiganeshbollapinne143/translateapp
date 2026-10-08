@@ -92,7 +92,7 @@ def translate(text, source, target):
             return_tensors="pt",
             padding=False,
             truncation=True,
-            max_length=128
+            max_length=512
         ).to(device)
 
         with torch.inference_mode():
