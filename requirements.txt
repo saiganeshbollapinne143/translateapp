@@ -1,4 +1,4 @@
-﻿streamlit
+streamlit
 torch
 transformers
 sentence-transformers
@@ -6,3 +6,5 @@ pypdf
 python-docx
 reportlab
 sentencepiece
+fpdf2
+uharfbuzz
