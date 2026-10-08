@@ -4,3 +4,4 @@ __pycache__/
 myenv/
 .venv/
 translations.db
+.streamlit/
