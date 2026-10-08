@@ -66,9 +66,10 @@ def translate(text, source, target):
             output = model.generate(
                 **inputs,
                 forced_bos_token_id=target_id,
-                max_new_tokens=800,
+                max_new_tokens=512,
                 num_beams=1,
                 do_sample=False
+
             )
         results.extend(tok.batch_decode(output, skip_special_tokens=True))
         bar.progress(min((start+len(batch))/len(chunks), 1.0))
