@@ -1,809 +1,235 @@
-import io
-import time
-import uuid
+import io, time, uuid, torch, chromadb, streamlit as st
+from pathlib import Path
 from functools import wraps
 from datetime import datetime
-from pathlib import Path
+from transformers import AutoTokenizer, AutoModelForSeq2SeqLM
+from pypdf import PdfReader
+from docx import Document
 
-import streamlit as st
-import chromadb
-
-
-# ============================================================
-# CONFIGURATION
-# ============================================================
-
-BASE_DIR = Path(__file__).parent
-CHROMA_DIR = BASE_DIR / "chroma_db"
-
-MODEL_NAME = "facebook/nllb-200-distilled-600M"
-
-LANGUAGES = {
-    "English": "eng_Latn",
-    "Hindi": "hin_Deva",
-    "Telugu": "tel_Telu",
-    "Tamil": "tam_Taml",
-    "Kannada": "kan_Knda",
-    "Malayalam": "mal_Mlym",
-    "French": "fra_Latn",
-    "German": "deu_Latn",
-    "Spanish": "spa_Latn",
-    "Italian": "ita_Latn",
+# ---------------- CONFIG ----------------
+MODEL = "facebook/nllb-200-distilled-600M"
+CHROMA_DIR = Path(__file__).parent / "chroma_db"
+LANG = {
+    "English": "eng_Latn", "Tamil": "tam_Taml",
+    "Telugu": "tel_Telu", "Hindi": "hin_Deva",
+    "Kannada": "kan_Knda", "Malayalam": "mal_Mlym",
+    "French": "fra_Latn", "German": "deu_Latn",
+    "Spanish": "spa_Latn"
 }
 
+st.set_page_config(page_title="AI Translator", page_icon="🌐", layout="wide")
 
-# ============================================================
-# DECORATORS
-# ============================================================
-
-def timer(func):
-
-    @wraps(func)
+# ---------------- DECORATORS ----------------
+def timer(fn):
+    @wraps(fn)
     def wrapper(*args, **kwargs):
-
         start = time.perf_counter()
-
-        result = func(*args, **kwargs)
-
-        elapsed = time.perf_counter() - start
-
-        st.caption(
-            f"⏱️ {func.__name__}: {elapsed:.2f} seconds"
-        )
-
+        result = fn(*args, **kwargs)
+        st.caption(f"⏱️ {fn.__name__}: {time.perf_counter()-start:.2f}s")
         return result
-
     return wrapper
 
-
-def handle_errors(func):
-
-    @wraps(func)
+def errors(fn):
+    @wraps(fn)
     def wrapper(*args, **kwargs):
-
         try:
-            return func(*args, **kwargs)
-
+            return fn(*args, **kwargs)
         except Exception as e:
-
-            st.error(
-                f"❌ Error in {func.__name__}: {e}"
-            )
-
+            st.error(f"❌ {e}")
             return None
-
     return wrapper
 
+# ---------------- MODEL ----------------
+@st.cache_resource(show_spinner="Loading NLLB model...")
+def load_model():
+    device = "cuda" if torch.cuda.is_available() else "cpu"
+    tokenizer = AutoTokenizer.from_pretrained(MODEL)
+    model = AutoModelForSeq2SeqLM.from_pretrained(MODEL).to(device)
+    model.eval()
+    return tokenizer, model, device
 
-# ============================================================
-# CHROMADB
-# ============================================================
-
+# ---------------- CHROMADB ----------------
 @st.cache_resource
-def get_chroma():
+def get_db():
+    client = chromadb.PersistentClient(path=str(CHROMA_DIR))
+    return client.get_or_create_collection("translation_history")
 
-    client = chromadb.PersistentClient(
-        path=str(CHROMA_DIR)
-    )
-
-    collection = client.get_or_create_collection(
-        name="translation_history"
-    )
-
-    return collection
-
-
-# ============================================================
-# THREAD ID
-# ============================================================
-
-def get_thread_id():
-
+def thread_id():
     if "thread_id" not in st.session_state:
-
-        st.session_state.thread_id = str(
-            uuid.uuid4()
-        )
-
+        st.session_state.thread_id = str(uuid.uuid4())
     return st.session_state.thread_id
 
-
-# ============================================================
-# SAVE TRANSLATION
-# ============================================================
-
-@handle_errors
-def save_translation(
-    source_text,
-    translated_text,
-    source_language,
-    target_language
-):
-
-    collection = get_chroma()
-
-    thread_id = get_thread_id()
-
-    timestamp = datetime.now().strftime(
-        "%Y-%m-%d %H:%M:%S"
-    )
-
-    translation_id = str(uuid.uuid4())
-
-    collection.add(
-
-        ids=[translation_id],
-
-        documents=[translated_text],
-
+@errors
+def save_history(source, target, original, translated):
+    get_db().add(
+        ids=[str(uuid.uuid4())],
+        documents=[translated],
         metadatas=[{
-
-            "source_text": source_text,
-
-            "source_language": source_language,
-
-            "target_language": target_language,
-
-            "thread_id": thread_id,
-
-            "timestamp": timestamp
-
+            "source": source,
+            "target": target,
+            "original": original,
+            "thread_id": thread_id(),
+            "time": datetime.now().strftime("%Y-%m-%d %H:%M:%S")
         }]
     )
 
+# ---------------- FILE READER ----------------
+@errors
+def read_file(file):
+    data = file.getvalue()
+    ext = file.name.lower().split(".")[-1]
 
-# ============================================================
-# LOAD MODEL
-# ============================================================
+    if ext == "txt":
+        return data.decode("utf-8", errors="ignore")
 
-@st.cache_resource(
-    show_spinner="Loading NLLB translation model..."
-)
-def load_model():
+    if ext == "pdf":
+        reader = PdfReader(io.BytesIO(data))
+        return "\n".join(page.extract_text() or "" for page in reader.pages)
 
-    import torch
+    if ext == "docx":
+        doc = Document(io.BytesIO(data))
+        return "\n".join(p.text for p in doc.paragraphs if p.text.strip())
 
-    from transformers import (
-        AutoTokenizer,
-        AutoModelForSeq2SeqLM
-    )
+    raise ValueError("Only TXT, PDF and DOCX files are supported.")
 
-    device = (
-        "cuda"
-        if torch.cuda.is_available()
-        else "cpu"
-    )
-
-    tokenizer = AutoTokenizer.from_pretrained(
-        MODEL_NAME
-    )
-
-    model = AutoModelForSeq2SeqLM.from_pretrained(
-        MODEL_NAME
-    )
-
-    model.eval()
-
-    model = model.to(device)
-
-    return tokenizer, model, device
-
-
-# ============================================================
-# SPLIT TEXT
-# ============================================================
-
+# ---------------- TRANSLATION ----------------
 @timer
-def split_text(text, max_chars=500):
-
-    paragraphs = [
-        p.strip()
-        for p in text.splitlines()
-        if p.strip()
-    ]
-
-    chunks = []
-
-    for paragraph in paragraphs:
-
-        if len(paragraph) <= max_chars:
-
-            chunks.append(paragraph)
-
-        else:
-
-            words = paragraph.split()
-
-            current = ""
-
-            for word in words:
-
-                if (
-                    len(current)
-                    + len(word)
-                    + 1
-                    <= max_chars
-                ):
-
-                    current += " " + word
-
-                else:
-
-                    if current:
-
-                        chunks.append(
-                            current.strip()
-                        )
-
-                    current = word
-
-            if current:
-
-                chunks.append(
-                    current.strip()
-                )
-
-    return chunks
-
-
-# ============================================================
-# TRANSLATION
-# ============================================================
-
-@timer
-@handle_errors
-def translate_text(
-    text,
-    source_language,
-    target_language
-):
-
-    import torch
-
+@errors
+def translate(text, source, target):
     tokenizer, model, device = load_model()
+    tokenizer.src_lang = source
+    target_id = tokenizer.convert_tokens_to_ids(target)
 
-    chunks = split_text(text)
-
-    tokenizer.src_lang = source_language
-
-    target_id = tokenizer.convert_tokens_to_ids(
-        target_language
-    )
-
+    chunks = [text[i:i+800] for i in range(0, len(text), 800)]
     results = []
+    progress = st.progress(0)
 
-    batch_size = (
-        8
-        if device == "cuda"
-        else 4
-    )
+    batch_size = 4 if device == "cuda" else 1
 
-    for start in range(
-        0,
-        len(chunks),
-        batch_size
-    ):
-
-        batch = chunks[
-            start:start + batch_size
-        ]
+    for start in range(0, len(chunks), batch_size):
+        batch = chunks[start:start + batch_size]
 
         inputs = tokenizer(
-            batch,
-            return_tensors="pt",
-            padding=True,
-            truncation=True,
-            max_length=384
+            batch, return_tensors="pt",
+            padding=True, truncation=True, max_length=512
         ).to(device)
 
         with torch.inference_mode():
-
             output = model.generate(
-
                 **inputs,
-
                 forced_bos_token_id=target_id,
-
-                max_new_tokens=384,
-
+                max_new_tokens=256,
                 num_beams=1,
-
                 do_sample=False
             )
 
-        translated = tokenizer.batch_decode(
-            output,
-            skip_special_tokens=True
+        results.extend(
+            tokenizer.batch_decode(
+                output, skip_special_tokens=True
+            )
         )
 
-        results.extend(translated)
+        progress.progress(min((start + len(batch)) / len(chunks), 1.0))
 
+    progress.empty()
     return "\n\n".join(results)
 
-
-# ============================================================
-# READ FILE
-# ============================================================
-
-@handle_errors
-def read_file(uploaded_file):
-
-    extension = (
-        uploaded_file.name
-        .lower()
-        .split(".")[-1]
-    )
-
-    data = uploaded_file.getvalue()
-
-    if extension == "txt":
-
-        return data.decode(
-            "utf-8",
-            errors="ignore"
-        )
-
-    if extension == "pdf":
-
-        from pypdf import PdfReader
-
-        reader = PdfReader(
-            io.BytesIO(data)
-        )
-
-        return "\n".join(
-            page.extract_text() or ""
-            for page in reader.pages
-        )
-
-    if extension == "docx":
-
-        from docx import Document
-
-        document = Document(
-            io.BytesIO(data)
-        )
-
-        return "\n".join(
-            p.text
-            for p in document.paragraphs
-            if p.text.strip()
-        )
-
-    raise ValueError(
-        "Only TXT, PDF and DOCX files are supported."
-    )
-
-
-# ============================================================
-# HISTORY
-# ============================================================
-
-@handle_errors
-def show_history(search_text=""):
-
-    collection = get_chroma()
-
-    total = collection.count()
-
-    if total == 0:
-
-        st.info(
-            "📝 No previous translations yet."
-        )
-
+# ---------------- HISTORY ----------------
+def show_history():
+    db = get_db()
+    if db.count() == 0:
+        st.info("📝 No previous translations.")
         return
 
-    data = collection.get(
-        include=[
-            "documents",
-            "metadatas"
-        ]
-    )
+    data = db.get(include=["documents", "metadatas"])
 
-    documents = data.get(
-        "documents",
-        []
-    )
-
-    metadatas = data.get(
-        "metadatas",
-        []
-    )
-
-    history = list(
-        zip(
-            documents,
-            metadatas
-        )
-    )
-
-    # Newest first
-    history.reverse()
-
-    if search_text:
-
-        search_text = (
-            search_text
-            .lower()
-            .strip()
-        )
-
-        history = [
-
-            item
-
-            for item in history
-
-            if (
-                search_text
-                in str(item[0]).lower()
-                or
-                search_text
-                in str(item[1]).lower()
-            )
-        ]
-
-    if not history:
-
-        st.warning(
-            "No matching history found."
-        )
-
-        return
-
-    for index, (
-        translated_text,
-        metadata
-    ) in enumerate(history):
-
-        source_language = metadata.get(
-            "source_language",
-            "Unknown"
-        )
-
-        target_language = metadata.get(
-            "target_language",
-            "Unknown"
-        )
-
-        timestamp = metadata.get(
-            "timestamp",
-            "Unknown"
-        )
-
-        thread_id = metadata.get(
-            "thread_id",
-            "Unknown"
-        )
-
-        source_text = metadata.get(
-            "source_text",
-            ""
-        )
-
+    for i, (doc, meta) in enumerate(
+        reversed(list(zip(data["documents"], data["metadatas"])))
+    ):
         with st.expander(
-
-            f"🌐 {source_language} → "
-            f"{target_language} | "
-            f"{timestamp}"
-
+            f"🌐 {meta['source']} → {meta['target']} | {meta['time']}"
         ):
-
-            st.caption(
-                f"🧵 Thread ID: {thread_id}"
+            st.caption(f"🧵 Thread: {meta['thread_id']}")
+            st.text_area("Original", meta["original"], height=100, key=f"o{i}")
+            st.text_area("Translation", doc, height=150, key=f"t{i}")
+            st.download_button(
+                "📥 Download",
+                doc,
+                f"translation_{i}.txt",
+                "text/plain",
+                key=f"d{i}"
             )
 
-            st.markdown(
-                "**Original Text**"
+# ---------------- UI ----------------
+st.title("🌐 AI Translator")
+st.caption("NLLB-200 • ChromaDB History • CPU/GPU Optimized")
+
+col1, col2 = st.columns(2)
+source_name = col1.selectbox("Source Language", list(LANG))
+target_name = col2.selectbox("Target Language", list(LANG), index=1)
+
+text = st.text_area(
+    "Enter text",
+    height=160,
+    placeholder="Type or paste your text..."
+)
+
+file = st.file_uploader(
+    "📁 Upload TXT / PDF / DOCX",
+    type=["txt", "pdf", "docx"]
+)
+
+if file:
+    text = read_file(file)
+    if text:
+        st.info(f"📄 Loaded: {file.name}")
+
+if st.button("🚀 Translate", type="primary", use_container_width=True):
+    if not text or not text.strip():
+        st.warning("Please enter text or upload a file.")
+    elif source_name == target_name:
+        st.warning("Please select different languages.")
+    else:
+        result = translate(
+            text,
+            LANG[source_name],
+            LANG[target_name]
+        )
+
+        if result:
+            save_history(
+                source_name,
+                target_name,
+                text,
+                result
             )
 
-            st.text_area(
-                "Original",
-                source_text,
-                height=120,
-                key=f"source_{index}"
-            )
-
-            st.markdown(
-                "**Translation**"
-            )
-
-            st.text_area(
-                "Translated",
-                translated_text,
-                height=180,
-                key=f"translated_{index}"
-            )
+            st.subheader("✅ Translation")
+            st.text_area("Output", result, height=300)
 
             st.download_button(
-
                 "📥 Download Translation",
-
-                translated_text.encode(
-                    "utf-8"
-                ),
-
-                file_name=(
-                    f"translation_{index}.txt"
-                ),
-
-                mime="text/plain",
-
-                key=f"download_{index}",
-
+                result,
+                "translation.txt",
+                "text/plain",
                 use_container_width=True
             )
 
-
-# ============================================================
-# CLEAR HISTORY
-# ============================================================
-
-@handle_errors
-def clear_history():
-
-    collection = get_chroma()
-
-    data = collection.get()
-
-    ids = data.get(
-        "ids",
-        []
-    )
-
-    if ids:
-
-        collection.delete(
-            ids=ids
-        )
-
-    st.success(
-        "🗑️ Translation history cleared."
-    )
-
-    st.rerun()
-
-
-# ============================================================
-# STREAMLIT PAGE
-# ============================================================
-
-st.set_page_config(
-
-    page_title="AI Translator",
-
-    page_icon="🌐",
-
-    layout="wide"
-)
-
-
-# ============================================================
-# SESSION
-# ============================================================
-
-thread_id = get_thread_id()
-
-
-# ============================================================
-# HEADER
-# ============================================================
-
-st.title(
-    "🌐 AI Translator"
-)
-
-st.caption(
-    "NLLB-200 Multilingual Translation "
-    "with ChromaDB History"
-)
-
-
-# ============================================================
-# LANGUAGE SELECTION
-# ============================================================
-
-col1, col2 = st.columns(2)
-
-source_name = col1.selectbox(
-
-    "Source Language",
-
-    list(LANGUAGES.keys())
-)
-
-target_name = col2.selectbox(
-
-    "Target Language",
-
-    list(LANGUAGES.keys()),
-
-    index=3
-)
-
-
-# ============================================================
-# INPUT
-# ============================================================
-
-text = st.text_area(
-
-    "Enter text",
-
-    height=180,
-
-    placeholder=(
-        "Type or paste your text here..."
-    )
-)
-
-
-uploaded_file = st.file_uploader(
-
-    "📁 Upload TXT / PDF / DOCX",
-
-    type=[
-        "txt",
-        "pdf",
-        "docx"
-    ]
-)
-
-
-# ============================================================
-# TRANSLATE BUTTON
-# ============================================================
-
-if st.button(
-
-    "🚀 Translate",
-
-    type="primary",
-
-    use_container_width=True
-):
-
-    if uploaded_file:
-
-        text = read_file(
-            uploaded_file
-        )
-
-    if not text:
-
-        st.warning(
-            "Please enter text or upload a file."
-        )
-
-        st.stop()
-
-    if source_name == target_name:
-
-        st.warning(
-            "Please select different languages."
-        )
-
-        st.stop()
-
-    translated = translate_text(
-
-        text,
-
-        LANGUAGES[source_name],
-
-        LANGUAGES[target_name]
-    )
-
-    if translated:
-
-        save_translation(
-
-            text,
-
-            translated,
-
-            source_name,
-
-            target_name
-        )
-
-        st.subheader(
-            "✅ Translation"
-        )
-
-        st.text_area(
-
-            "Output",
-
-            translated,
-
-            height=300
-        )
-
-        st.download_button(
-
-            "📥 Download TXT",
-
-            translated.encode(
-                "utf-8"
-            ),
-
-            file_name="translation.txt",
-
-            mime="text/plain",
-
-            use_container_width=True
-        )
-
-        st.success(
-            "Translation completed and saved to history."
-        )
-
-
-# ============================================================
-# CURRENT THREAD
-# ============================================================
-
-with st.expander(
-    "🧵 Current Thread Information"
-):
-
-    st.write(
-        f"**Thread ID:** `{thread_id}`"
-    )
-
-    st.write(
-        f"**ChromaDB Records:** "
-        f"`{get_chroma().count()}`"
-    )
-
-
-# ============================================================
-# PREVIOUS HISTORY
-# ============================================================
+            st.success("Translation saved to history.")
+
+# ---------------- THREAD / HISTORY ----------------
+with st.expander("🧵 Current Thread"):
+    st.write(f"Thread ID: `{thread_id()}`")
+    st.write(f"ChromaDB Records: `{get_db().count()}`")
 
 st.divider()
+st.subheader("🕘 Previous Translation History")
 
-st.subheader(
-    "🕘 Previous Translation History"
-)
+if st.button("🗑️ Clear History"):
+    ids = get_db().get()["ids"]
+    if ids:
+        get_db().delete(ids=ids)
+    st.success("History cleared.")
+    st.rerun()
 
-
-search_history = st.text_input(
-
-    "🔍 Search History",
-
-    placeholder=(
-        "Search language, text, "
-        "thread ID, etc."
-    )
-)
-
-
-col1, col2 = st.columns(2)
-
-with col1:
-
-    if st.button(
-        "🔎 Search",
-        use_container_width=True
-    ):
-
-        show_history(
-            search_history
-        )
-
-with col2:
-
-    if st.button(
-        "🗑️ Clear History",
-        use_container_width=True
-    ):
-
-        clear_history()
-
-
-if not search_history:
-
-    show_history()
+show_history()
