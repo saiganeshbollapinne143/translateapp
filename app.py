@@ -1,7 +1,7 @@
 import time
 import io
-import sqlite3
 import uuid
+import chromadb
 from functools import wraps
 from pathlib import Path
 from datetime import datetime
@@ -15,7 +15,8 @@ import streamlit as st
 
 BASE_DIR = Path(__file__).parent
 MODEL_NAME = "facebook/nllb-200-distilled-600M"
-DB_FILE = BASE_DIR / "translations.db"
+
+CHROMA_DIR = BASE_DIR / "chroma_db"
 
 LANGUAGES = {
     "English": "eng_Latn",
@@ -32,11 +33,10 @@ LANGUAGES = {
 
 
 # =========================================================
-# CUSTOM DECORATORS
+# DECORATORS
 # =========================================================
 
 def timer(func):
-    """Measure function execution time."""
 
     @wraps(func)
     def wrapper(*args, **kwargs):
@@ -57,7 +57,6 @@ def timer(func):
 
 
 def handle_errors(func):
-    """Handle errors without crashing Streamlit."""
 
     @wraps(func)
     def wrapper(*args, **kwargs):
@@ -66,41 +65,32 @@ def handle_errors(func):
             return func(*args, **kwargs)
 
         except Exception as e:
+
             st.error(
-                f"❌ Error in {func.__name__}: {e}"
+                f"❌ {func.__name__}: {e}"
             )
+
             return None
 
     return wrapper
 
 
 # =========================================================
-# DATABASE
+# CHROMADB
 # =========================================================
 
 @st.cache_resource
-def get_database():
+def get_chroma():
 
-    connection = sqlite3.connect(
-        DB_FILE,
-        check_same_thread=False
+    client = chromadb.PersistentClient(
+        path=str(CHROMA_DIR)
     )
 
-    connection.execute("""
-        CREATE TABLE IF NOT EXISTS translations (
-            id TEXT PRIMARY KEY,
-            timestamp TEXT,
-            source_language TEXT,
-            target_language TEXT,
-            source_text TEXT,
-            translated_text TEXT,
-            thread_id TEXT
-        )
-    """)
+    collection = client.get_or_create_collection(
+        name="translations"
+    )
 
-    connection.commit()
-
-    return connection
+    return collection
 
 
 @handle_errors
@@ -112,37 +102,38 @@ def save_translation(
     thread_id
 ):
 
-    db = get_database()
+    collection = get_chroma()
 
-    db.execute(
-        """
-        INSERT INTO translations
-        VALUES (?, ?, ?, ?, ?, ?, ?)
-        """,
-        (
-            str(uuid.uuid4()),
-            datetime.now().strftime(
+    translation_id = str(uuid.uuid4())
+
+    collection.add(
+        ids=[translation_id],
+
+        documents=[translated],
+
+        metadatas=[{
+            "timestamp": datetime.now().strftime(
                 "%Y-%m-%d %H:%M:%S"
             ),
-            source_language,
-            target_language,
-            source,
-            translated,
-            thread_id
-        )
+            "source_language": source_language,
+            "target_language": target_language,
+            "thread_id": thread_id,
+            "source_text": source
+        }]
     )
-
-    db.commit()
 
 
 # =========================================================
 # MODEL
 # =========================================================
 
-@st.cache_resource(show_spinner="Loading NLLB model...")
+@st.cache_resource(
+    show_spinner="Loading NLLB-200 model..."
+)
 def load_model():
 
     import torch
+
     from transformers import (
         AutoTokenizer,
         AutoModelForSeq2SeqLM
@@ -159,19 +150,11 @@ def load_model():
     )
 
     model = AutoModelForSeq2SeqLM.from_pretrained(
-        MODEL_NAME,
-        low_cpu_mem_usage=True
+        MODEL_NAME
     )
 
     model.eval()
-
-    if device == "cuda":
-
-        model = model.half().to(device)
-
-    else:
-
-        model = model.to(device)
+    model.to(device)
 
     return tokenizer, model, device
 
@@ -197,31 +180,33 @@ def split_text(text, max_chars=500):
 
             chunks.append(paragraph)
 
-        else:
+            continue
 
-            words = paragraph.split()
+        words = paragraph.split()
 
-            current = ""
+        current = ""
 
-            for word in words:
+        for word in words:
 
-                if len(current) + len(word) + 1 <= max_chars:
+            if len(current) + len(word) + 1 <= max_chars:
 
-                    current += " " + word
+                current += " " + word
 
-                else:
+            else:
 
-                    if current:
-                        chunks.append(
-                            current.strip()
-                        )
+                if current:
 
-                    current = word
+                    chunks.append(
+                        current.strip()
+                    )
 
-            if current:
-                chunks.append(
-                    current.strip()
-                )
+                current = word
+
+        if current:
+
+            chunks.append(
+                current.strip()
+            )
 
     return chunks
 
@@ -244,6 +229,9 @@ def translate_text(
 
     chunks = split_text(text)
 
+    if not chunks:
+        return None
+
     tokenizer.src_lang = source_language
 
     target_id = tokenizer.convert_tokens_to_ids(
@@ -255,12 +243,16 @@ def translate_text(
     batch_size = (
         16
         if device == "cuda"
-        else 8
+        else 4
     )
+
+    progress = st.progress(0)
+
+    total = len(chunks)
 
     for start in range(
         0,
-        len(chunks),
+        total,
         batch_size
     ):
 
@@ -274,7 +266,12 @@ def translate_text(
             padding=True,
             truncation=True,
             max_length=384
-        ).to(device)
+        )
+
+        inputs = {
+            key: value.to(device)
+            for key, value in inputs.items()
+        }
 
         with torch.inference_mode():
 
@@ -292,6 +289,15 @@ def translate_text(
                 skip_special_tokens=True
             )
         )
+
+        progress.progress(
+            min(
+                (start + len(batch)) / total,
+                1.0
+            )
+        )
+
+    progress.empty()
 
     return "\n\n".join(results)
 
@@ -311,6 +317,7 @@ def read_file(uploaded_file):
 
     data = uploaded_file.getvalue()
 
+    # TXT
     if extension == "txt":
 
         return data.decode(
@@ -318,6 +325,7 @@ def read_file(uploaded_file):
             errors="ignore"
         )
 
+    # PDF
     if extension == "pdf":
 
         from pypdf import PdfReader
@@ -326,11 +334,19 @@ def read_file(uploaded_file):
             io.BytesIO(data)
         )
 
-        return "\n".join(
-            page.extract_text() or ""
-            for page in reader.pages
-        )
+        pages = []
 
+        for page in reader.pages:
+
+            page_text = page.extract_text()
+
+            if page_text:
+
+                pages.append(page_text)
+
+        return "\n".join(pages)
+
+    # DOCX
     if extension == "docx":
 
         from docx import Document
@@ -351,13 +367,8 @@ def read_file(uploaded_file):
 
 
 # =========================================================
-# STREAMLIT APP
+# STREAMLIT CONFIG
 # =========================================================
-
-@st.cache_data
-def create_thread_id():
-    return str(uuid.uuid4())
-
 
 st.set_page_config(
     page_title="AI Translator",
@@ -365,22 +376,33 @@ st.set_page_config(
     layout="wide"
 )
 
+
+# =========================================================
+# SESSION
+# =========================================================
+
 if "thread_id" not in st.session_state:
 
-    st.session_state.thread_id = (
-        create_thread_id()
+    st.session_state.thread_id = str(
+        uuid.uuid4()
     )
 
+
+# =========================================================
+# UI
+# =========================================================
 
 st.title("🌐 AI Translator")
 
 st.caption(
-    "Fast NLLB-200 multilingual translation"
+    "Fast multilingual translation using NLLB-200"
 )
+
+st.divider()
 
 
 # =========================================================
-# LANGUAGE SELECTION
+# LANGUAGE
 # =========================================================
 
 col1, col2 = st.columns(2)
@@ -403,7 +425,8 @@ target_name = col2.selectbox(
 
 text = st.text_area(
     "Enter text",
-    height=180
+    height=180,
+    placeholder="Enter text to translate..."
 )
 
 uploaded_file = st.file_uploader(
@@ -439,7 +462,7 @@ if st.button(
     if source_name == target_name:
 
         st.warning(
-            "Select different languages."
+            "Please select different languages."
         )
 
         st.stop()
@@ -460,12 +483,14 @@ if st.button(
             st.session_state.thread_id
         )
 
+        st.divider()
+
         st.subheader(
             "✅ Translation"
         )
 
         st.text_area(
-            "Output",
+            "Translated Output",
             translated,
             height=350
         )
@@ -479,5 +504,28 @@ if st.button(
         )
 
         st.success(
-            "Translation completed."
+            "Translation completed successfully!"
         )
+
+
+# =========================================================
+# CHROMADB INFO
+# =========================================================
+
+with st.expander("ChromaDB Information"):
+
+    try:
+
+        collection = get_chroma()
+
+        st.write(
+            f"Stored translations: **{collection.count()}**"
+        )
+
+        st.write(
+            f"Thread ID: `{st.session_state.thread_id}`"
+        )
+
+    except Exception as e:
+
+        st.error(str(e))
