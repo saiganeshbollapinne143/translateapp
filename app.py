@@ -1,7 +1,7 @@
-import os
+import csv
+import io
+import importlib.metadata as md
 import uuid
-import hmac
-import hashlib
 from datetime import datetime
 from pathlib import Path
 
@@ -23,7 +23,7 @@ st.set_page_config(page_title="AI Translator", page_icon="🌐", layout="wide")
 BASE_DIR = Path(__file__).parent
 MODEL = "facebook/nllb-200-distilled-600M"
 DEVICE = "cuda" if torch.cuda.is_available() else "cpu"
-DB_PATH = str(BASE_DIR / "chroma_db")  # persistent (was /tmp, which gets wiped)
+DB_PATH = str(BASE_DIR / "chroma_db")
 
 LANGUAGES = {
     "English": "eng_Latn",
@@ -47,70 +47,6 @@ SCRIPT_FONTS = {
     "Kannada": "NotoSansKannada-Regular.ttf",
     "Malayalam": "NotoSansMalayalam-Regular.ttf",
 }
-
-# =========================================================
-# AUTH  (admin = read + write, user = read + use translator)
-# =========================================================
-# Set passwords in .streamlit/secrets.toml:
-#   ADMIN_PASSWORD = "your-strong-password"
-#   USER_PASSWORD  = "another-password"
-# or as environment variables. Defaults below are for local testing only.
-
-
-def get_secret(key, default):
-    try:
-        return st.secrets[key]
-    except Exception:
-        return os.getenv(key, default)
-
-
-def sha(value):
-    return hashlib.sha256(value.encode()).hexdigest()
-
-
-USING_DEFAULT_PASSWORDS = (
-    get_secret("ADMIN_PASSWORD", "") == "" or get_secret("USER_PASSWORD", "") == ""
-)
-
-USERS = {
-    "admin": {
-        "hash": sha(get_secret("ADMIN_PASSWORD", "admin123")),
-        "role": "admin",
-    },
-    "user": {
-        "hash": sha(get_secret("USER_PASSWORD", "user123")),
-        "role": "user",
-    },
-}
-
-
-def login_page():
-    st.title("🔐 AI Translator Login")
-
-    if USING_DEFAULT_PASSWORDS:
-        st.warning("Default passwords are active. Set ADMIN_PASSWORD and USER_PASSWORD before deploying.")
-
-    with st.form("login"):
-        username = st.text_input("Username")
-        password = st.text_input("Password", type="password")
-        submitted = st.form_submit_button("Login", type="primary")
-
-    if submitted:
-        account = USERS.get(username.strip().lower())
-        if account and hmac.compare_digest(account["hash"], sha(password)):
-            st.session_state.auth = True
-            st.session_state.username = username.strip().lower()
-            st.session_state.role = account["role"]
-            st.rerun()
-        else:
-            st.error("Invalid username or password.")
-
-
-if not st.session_state.get("auth"):
-    login_page()
-    st.stop()
-
-IS_ADMIN = st.session_state.role == "admin"
 
 # =========================================================
 # CHROMADB + MODEL
@@ -211,7 +147,6 @@ def save_record(source_text, translated_text, source_language, target_language):
                 "source_language": source_language,
                 "target_language": target_language,
                 "thread_id": st.session_state.thread_id,
-                "username": st.session_state.username,
                 "timestamp": datetime.now().strftime("%Y-%m-%d %H:%M:%S"),
             }
         ],
@@ -235,7 +170,7 @@ def create_pdf(text, language):
     else:
         if script_path:
             return None
-        latin_name = None  # core Helvetica for French/German/Spanish/Italian
+        latin_name = None
 
     if script_path:
         pdf.add_font("Script", "", str(script_path))
@@ -256,7 +191,7 @@ def create_pdf(text, language):
 
 
 def load_records(search=""):
-    """Return list of dicts (id, translated, metadata), newest first."""
+    """Return list of dicts (translated + metadata), newest first."""
     total = collection.count()
     if total == 0:
         return []
@@ -281,12 +216,11 @@ def load_records(search=""):
 # =========================================================
 
 st.sidebar.title("🌐 AI Translator")
-st.sidebar.write(f"👤 **{st.session_state.username}**")
-st.sidebar.caption(
-    "Role: Admin (read + write)" if IS_ADMIN else "Role: User (read + use only)"
-)
 
-page = st.sidebar.radio("Navigation", ["🏠 Translator", "📚 History"])
+page = st.sidebar.radio(
+    "Navigation",
+    ["🏠 Translator", "📚 History", "📊 Usage", "ℹ️ Requirements & Guide"],
+)
 
 st.sidebar.divider()
 st.sidebar.write("**Current Thread**")
@@ -296,13 +230,8 @@ if st.sidebar.button("🆕 New Conversation"):
     st.session_state.thread_id = str(uuid.uuid4())
     st.rerun()
 
-if st.sidebar.button("🚪 Logout"):
-    for key in ["auth", "username", "role", "last_result"]:
-        st.session_state.pop(key, None)
-    st.rerun()
-
 # =========================================================
-# TRANSLATOR PAGE  (admin + user)
+# TRANSLATOR PAGE
 # =========================================================
 
 if page == "🏠 Translator":
@@ -335,7 +264,6 @@ if page == "🏠 Translator":
         translated = translate(text, LANGUAGES[source_name], LANGUAGES[target_name])
         save_record(text, translated, source_name, target_name)
 
-        # keep result in session so download buttons don't wipe it on rerun
         st.session_state.last_result = {
             "text": translated,
             "target": target_name,
@@ -371,26 +299,21 @@ if page == "🏠 Translator":
                 )
 
 # =========================================================
-# HISTORY PAGE  (admin: read + write, user: read only)
+# HISTORY PAGE (read + write)
 # =========================================================
 
 if page == "📚 History":
     st.title("📚 Translation History")
-    st.caption(
-        "Full access: view, edit, delete, export."
-        if IS_ADMIN
-        else "Read-only view of saved translations."
-    )
+    st.caption("View, edit and delete saved translation records")
 
     search = st.text_input(
         "🔎 Search translation history", placeholder="Search saved translations..."
     )
     records = load_records(search)
 
-    col1, col2, col3 = st.columns(3)
+    col1, col2 = st.columns(2)
     col1.metric("Total Records", collection.count())
     col2.metric("Shown", len(records))
-    col3.metric("Access", "Read + Write" if IS_ADMIN else "Read only")
 
     st.divider()
 
@@ -403,9 +326,7 @@ if page == "📚 History":
             head.markdown(
                 f"### 🌐 {rec.get('source_language', '?')} → {rec.get('target_language', '?')}"
             )
-            stamp.caption(
-                f"{rec.get('timestamp', '')}  \n👤 {rec.get('username', 'unknown')}"
-            )
+            stamp.caption(rec.get("timestamp", ""))
 
             left, right = st.columns(2)
             with left:
@@ -417,43 +338,233 @@ if page == "📚 History":
 
             st.caption(f"🧵 Thread ID: {rec.get('thread_id', '')}")
 
-            # ---------- WRITE ACTIONS: ADMIN ONLY ----------
-            if IS_ADMIN:
-                with st.expander("✏️ Edit / 🗑️ Delete (admin)"):
-                    new_text = st.text_area(
-                        "Edit translated text",
-                        rec["translated"],
-                        key=f"edit_{rec['id']}",
-                        height=150,
-                    )
-                    c1, c2 = st.columns(2)
-                    if c1.button("💾 Save changes", key=f"save_{rec['id']}"):
-                        collection.update(ids=[rec["id"]], documents=[new_text])
-                        st.success("Record updated.")
-                        st.rerun()
-                    if c2.button("🗑️ Delete record", key=f"del_{rec['id']}"):
-                        collection.delete(ids=[rec["id"]])
-                        st.success("Record deleted.")
-                        st.rerun()
+            with st.expander("✏️ Edit / 🗑️ Delete"):
+                new_text = st.text_area(
+                    "Edit translated text",
+                    rec["translated"],
+                    key=f"edit_{rec['id']}",
+                    height=150,
+                )
+                c1, c2 = st.columns(2)
+                if c1.button("💾 Save changes", key=f"save_{rec['id']}"):
+                    collection.update(ids=[rec["id"]], documents=[new_text])
+                    st.success("Record updated.")
+                    st.rerun()
+                if c2.button("🗑️ Delete record", key=f"del_{rec['id']}"):
+                    collection.delete(ids=[rec["id"]])
+                    st.success("Record deleted.")
+                    st.rerun()
 
-    # ---------- ADMIN-ONLY BULK ACTIONS ----------
-    if IS_ADMIN and collection.count() > 0:
+    if collection.count() > 0:
         st.divider()
-        st.subheader("🛠️ Admin Tools")
 
-        all_records = load_records()
-        df = pd.DataFrame(all_records)
+        buf = io.StringIO()
+        writer = csv.writer(buf)
+        writer.writerow(
+            ["timestamp", "source_language", "target_language", "source_text", "translated_text", "thread_id"]
+        )
+        for r in load_records():
+            writer.writerow(
+                [
+                    r.get("timestamp", ""),
+                    r.get("source_language", ""),
+                    r.get("target_language", ""),
+                    r.get("source_text", ""),
+                    r["translated"],
+                    r.get("thread_id", ""),
+                ]
+            )
         st.download_button(
             "⬇️ Export history (CSV)",
-            df.to_csv(index=False).encode("utf-8-sig"),
+            buf.getvalue().encode("utf-8-sig"),
             file_name="translation_history.csv",
             mime="text/csv",
         )
 
         confirm = st.checkbox("I understand this will permanently delete all records")
-        if st.button("🗑️ Clear All History", type="secondary", disabled=not confirm):
+        if st.button("🗑️ Clear All History", disabled=not confirm):
             all_ids = collection.get()["ids"]
             if all_ids:
                 collection.delete(ids=all_ids)
             st.success("Translation history cleared.")
             st.rerun()
+
+
+# =========================================================
+# USAGE DASHBOARD (visual)
+# =========================================================
+
+if page == "📊 Usage":
+    st.title("📊 Usage Dashboard")
+    st.caption("See visually how the translator is being used")
+
+    records = load_records()
+
+    if not records:
+        st.info("No usage data yet. Translate something and it will appear here.")
+    else:
+        df = pd.DataFrame(records)
+        for col in ["timestamp", "source_text", "source_language", "target_language", "thread_id"]:
+            if col not in df:
+                df[col] = ""
+
+        df["timestamp"] = pd.to_datetime(df["timestamp"], errors="coerce")
+        df["date"] = df["timestamp"].dt.date
+        df["characters"] = df["source_text"].astype(str).str.len()
+        df["pair"] = df["source_language"] + " → " + df["target_language"]
+
+        c1, c2, c3, c4 = st.columns(4)
+        c1.metric("Translations", len(df))
+        c2.metric("Characters translated", f"{int(df['characters'].sum()):,}")
+        c3.metric("Conversations", df["thread_id"].nunique())
+        c4.metric("Top target language", df["target_language"].mode().iat[0])
+
+        st.divider()
+
+        left, right = st.columns(2)
+        with left:
+            st.subheader("Translations per day")
+            st.bar_chart(df.groupby("date").size())
+        with right:
+            st.subheader("Target languages")
+            st.bar_chart(df["target_language"].value_counts())
+
+        st.subheader("Language pairs")
+        pairs = (
+            df["pair"]
+            .value_counts()
+            .rename_axis("Language pair")
+            .reset_index(name="Translations")
+        )
+        pairs["Share"] = pairs["Translations"] / pairs["Translations"].sum() * 100
+        st.dataframe(
+            pairs,
+            hide_index=True,
+            use_container_width=True,
+            column_config={
+                "Share": st.column_config.ProgressColumn(
+                    "Share", format="%.0f%%", min_value=0, max_value=100
+                )
+            },
+        )
+
+        st.subheader("Recent activity")
+        recent = (
+            df.sort_values("timestamp", ascending=False)
+            .head(10)[["timestamp", "pair", "characters", "thread_id"]]
+            .rename(
+                columns={
+                    "timestamp": "Time",
+                    "pair": "Language pair",
+                    "characters": "Characters",
+                    "thread_id": "Thread",
+                }
+            )
+        )
+        st.dataframe(recent, hide_index=True, use_container_width=True)
+        st.caption("Character counts use the saved source text (stored up to 4,000 characters per record).")
+
+# =========================================================
+# REQUIREMENTS & GUIDE (visual)
+# =========================================================
+
+if page == "ℹ️ Requirements & Guide":
+    st.title("ℹ️ Requirements & Guide")
+    st.caption("What the app needs, whether it is ready, and how to use it")
+
+    def pkg_version(name):
+        try:
+            return md.version(name)
+        except md.PackageNotFoundError:
+            return None
+
+    packages = [
+        ("streamlit", "Web interface"),
+        ("torch", "Runs the translation model"),
+        ("transformers", "Loads NLLB-200"),
+        ("sentencepiece", "Tokenizer for NLLB"),
+        ("chromadb", "Stores translation history"),
+        ("pypdf", "Reads PDF uploads"),
+        ("python-docx", "Reads DOCX uploads"),
+        ("fpdf2", "Creates PDF downloads"),
+        ("uharfbuzz", "Shapes Tamil/Hindi text in PDFs"),
+        ("pandas", "Usage charts"),
+    ]
+    pkg_rows = []
+    for name, purpose in packages:
+        version = pkg_version(name)
+        pkg_rows.append(
+            {
+                "Package": name,
+                "Used for": purpose,
+                "Status": "✅ Installed" if version else "❌ Missing",
+                "Version": version or "-",
+            }
+        )
+
+    font_files = [("All languages (Latin text)", LATIN_FONT)] + [
+        (lang, BASE_DIR / file) for lang, file in SCRIPT_FONTS.items()
+    ]
+    font_rows = [
+        {
+            "Language": lang,
+            "Font file": path.name,
+            "Status": "✅ Found" if path.exists() else "❌ Missing",
+        }
+        for lang, path in font_files
+    ]
+
+    ready = sum(r["Status"].startswith("✅") for r in pkg_rows + font_rows)
+    total = len(pkg_rows) + len(font_rows)
+
+    st.subheader("Readiness")
+    st.progress(ready / total, text=f"{ready} of {total} requirements ready")
+
+    c1, c2, c3 = st.columns(3)
+    c1.metric("Device", "GPU (CUDA)" if DEVICE == "cuda" else "CPU")
+    c2.metric("Model", MODEL.split("/")[-1])
+    c3.metric("History records", collection.count())
+
+    st.divider()
+
+    left, right = st.columns(2)
+    with left:
+        st.subheader("Python packages")
+        st.dataframe(pd.DataFrame(pkg_rows), hide_index=True, use_container_width=True)
+        st.code(
+            "pip install streamlit torch transformers sentencepiece chromadb "
+            "pypdf python-docx fpdf2 uharfbuzz pandas",
+            language="bash",
+        )
+    with right:
+        st.subheader("Fonts for PDF download")
+        st.dataframe(pd.DataFrame(font_rows), hide_index=True, use_container_width=True)
+        st.caption(
+            "Place the Noto .ttf files next to app.py. Missing fonts only affect the "
+            "PDF download; translation and TXT download still work."
+        )
+
+    st.divider()
+    st.subheader("How to use")
+
+    steps = [
+        ("1️⃣ Choose languages", "Pick the source and target language on the Translator page."),
+        ("2️⃣ Add content", "Type or paste text, or upload a TXT, PDF or DOCX file."),
+        ("3️⃣ Translate", "Click Translate, then download the result as TXT or PDF."),
+        ("4️⃣ Review", "Open History to read, edit or delete records, and Usage to see charts."),
+    ]
+    for col, (title, desc) in zip(st.columns(4), steps):
+        with col:
+            with st.container(border=True):
+                st.markdown(f"**{title}**")
+                st.write(desc)
+
+    st.subheader("Good to know")
+    st.markdown(
+        """
+- Every translation is saved automatically to history (stored in the `chroma_db` folder).
+- Long text is split into small chunks so nothing gets cut off.
+- Supported languages: English, Hindi, Telugu, Tamil, Kannada, Malayalam, French, German, Spanish, Italian.
+- Start the app with `streamlit run app.py`.
+"""
+    )
