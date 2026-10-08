@@ -1,8 +1,16 @@
-import io, uuid, gc, torch, chromadb, streamlit as st
+import os, io, uuid, gc, torch, chromadb, streamlit as st
 from datetime import datetime
+from dotenv import load_dotenv
 from transformers import AutoTokenizer, AutoModelForSeq2SeqLM
 from pypdf import PdfReader
 from docx import Document
+
+# ================= ENVIRONMENT & SECRETS SETUP =================
+load_dotenv()  # Load variables from local .env file
+
+# Fallback: Sync Streamlit Cloud secrets to os.environ for Hugging Face
+if "HF_TOKEN" not in os.environ and "HF_TOKEN" in st.secrets:
+    os.environ["HF_TOKEN"] = st.secrets["HF_TOKEN"]
 
 MODEL = "facebook/nllb-200-distilled-600M"
 LANG = {
@@ -21,18 +29,20 @@ st.markdown("""
 </style>
 """, unsafe_allow_html=True)
 
-# ================= MODEL LOADING (OOM SAFE) =================
+# ================= MODEL LOADING (AUTO-DETECTS HF_TOKEN) =================
 @st.cache_resource(show_spinner="Loading NLLB model...")
 def load_model():
     device = "cuda" if torch.cuda.is_available() else "cpu"
+
+    # Automatically uses os.environ["HF_TOKEN"]
     tokenizer = AutoTokenizer.from_pretrained(MODEL)
-    
-    # Load model with minimal RAM footprint
     model = AutoModelForSeq2SeqLM.from_pretrained(
         MODEL,
-        torch_dtype=torch.float32 if device == "cpu" else torch.float16
+        dtype=torch.float32 if device == "cpu" else torch.float16
     ).to(device)
-    
+
+    # Resolve max_length conflict warning
+    model.generation_config.max_length = None
     model.eval()
     return tokenizer, model, device
 
@@ -53,34 +63,30 @@ def read_file(file):
 
     if ext == "txt":
         return data.decode("utf-8", errors="ignore")
-
     if ext == "pdf":
         reader = PdfReader(io.BytesIO(data))
         return "\n".join(page.extract_text() or "" for page in reader.pages)
-
     if ext == "docx":
         doc = Document(io.BytesIO(data))
         return "\n".join(p.text for p in doc.paragraphs if p.text.strip())
-
     return ""
 
-# ================= TRANSLATION (OOM PROTECTED) =================
+# ================= TRANSLATION (OOM SAFE) =================
 def translate(text, source, target):
     tokenizer, model, device = load_model()
-    
+
     tokenizer.src_lang = source
     if hasattr(tokenizer, "lang_code_to_id") and target in tokenizer.lang_code_to_id:
         target_id = tokenizer.lang_code_to_id[target]
     else:
         target_id = tokenizer.convert_tokens_to_ids(target)
 
-    # 1. Smaller chunk size (150 chars) to prevent context explosion
+    # 150-char chunking to avoid RAM spikes on Streamlit Cloud CPU
     chunks = [text[i:i+150] for i in range(0, len(text), 150)]
     results = []
     
     progress_bar = st.progress(0)
 
-    # 2. Strict sequential batch size = 1 to conserve RAM
     for i, chunk in enumerate(chunks):
         inputs = tokenizer(
             chunk,
@@ -95,20 +101,19 @@ def translate(text, source, target):
                 inputs["input_ids"],
                 attention_mask=inputs.get("attention_mask"),
                 forced_bos_token_id=target_id,
-                max_new_tokens=128,  # Cap token generation per chunk
+                max_new_tokens=128,
+                max_length=None,
                 num_beams=1,
                 do_sample=False
             )
 
         decoded = tokenizer.batch_decode(output, skip_special_tokens=True)
         results.extend(decoded)
-
-        # Update progress bar
         progress_bar.progress((i + 1) / len(chunks))
 
     progress_bar.empty()
 
-    # 3. Aggressive RAM & Cache Cleanup
+    # Aggressive memory cleanup
     del inputs, output
     gc.collect()
     if torch.cuda.is_available():
@@ -133,7 +138,6 @@ def save_history(source, target, original, translated):
 # ================= HISTORY DISPLAY =================
 def show_history(search=""):
     db = get_db()
-
     if db.count() == 0:
         st.info("📝 No previous translations.")
         return
@@ -150,10 +154,10 @@ def show_history(search=""):
         records = [
             (doc, meta) for doc, meta in records
             if search in str(doc).lower()
-            or search in str(meta.get("original","")).lower()
-            or search in str(meta.get("source","")).lower()
-            or search in str(meta.get("target","")).lower()
-            or search in str(meta.get("thread","")).lower()
+            or search in str(meta.get("original", "")).lower()
+            or search in str(meta.get("source", "")).lower()
+            or search in str(meta.get("target", "")).lower()
+            or search in str(meta.get("thread", "")).lower()
         ]
 
     if not records:
@@ -170,11 +174,9 @@ def show_history(search=""):
         with st.expander(f"🌐 {source} → {target} • Thread {thread} • {time}"):
             st.caption(f"🧵 Thread ID: `{thread}`")
             c1, c2 = st.columns(2)
-
             with c1:
                 st.markdown("**Original**")
                 st.text_area("Original", original, height=150, key=f"o{i}")
-
             with c2:
                 st.markdown("**Translation**")
                 st.text_area("Translation", translated, height=150, key=f"t{i}")
@@ -187,34 +189,22 @@ def show_history(search=""):
                 key=f"d{i}"
             )
 
-# ================= HEADER =================
+# ================= UI LAYOUT =================
 st.markdown('<div class="title">🌐 AI Translator</div>', unsafe_allow_html=True)
 st.markdown('<div class="sub">Fast multilingual translation powered by NLLB-200</div>', unsafe_allow_html=True)
 
-# ================= LANGUAGE SELECT =================
 c1, c2 = st.columns(2)
 source_name = c1.selectbox("Source Language", list(LANG.keys()))
 target_name = c2.selectbox("Target Language", list(LANG.keys()), index=1)
 
-# ================= INPUT SECTION =================
-input_text = st.text_area(
-    "Text to translate",
-    height=160,
-    placeholder="Type or paste text here..."
-)
-
+input_text = st.text_area("Text to translate", height=160, placeholder="Type or paste text here...")
 uploaded = st.file_uploader("📁 Upload TXT / PDF / DOCX", type=["txt", "pdf", "docx"])
 
 if uploaded:
     st.success(f"📄 {uploaded.name} loaded successfully")
 
-# ================= TRANSLATE BUTTON =================
 if st.button("🚀 Translate", type="primary", use_container_width=True):
-    source_text = ""
-    if uploaded:
-        source_text = read_file(uploaded)
-    elif input_text.strip():
-        source_text = input_text
+    source_text = read_file(uploaded) if uploaded else input_text
 
     if not source_text.strip():
         st.warning("Please enter text or upload a valid document.")
@@ -230,7 +220,6 @@ if st.button("🚀 Translate", type="primary", use_container_width=True):
             st.success("✅ Translation completed.")
             st.subheader("Translation Result")
             st.text_area("Result Output", result, height=250)
-
             st.download_button(
                 "📥 Download Translation",
                 result,
@@ -241,23 +230,18 @@ if st.button("🚀 Translate", type="primary", use_container_width=True):
         except Exception as e:
             st.error(f"Translation Error: {str(e)}")
 
-# ================= CURRENT THREAD =================
 st.divider()
 c1, c2 = st.columns([4, 1])
-
 with c1:
     st.write("🧵 **Current Thread ID**")
     st.code(str(st.session_state.thread_id))
-
 with c2:
     if st.button("＋ New Thread", use_container_width=True):
         st.session_state.thread_id += 1
         st.rerun()
 
-# ================= HISTORY SECTION =================
 st.divider()
 st.subheader("🕘 Translation History")
-
 search = st.text_input("🔍 Search History", placeholder="Search text, language or thread ID...")
 show_history(search)
 
