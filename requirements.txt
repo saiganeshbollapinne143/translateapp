@@ -8,3 +8,4 @@ reportlab
 sentencepiece
 fpdf2
 uharfbuzz
+chromadb
