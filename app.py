@@ -83,7 +83,7 @@ def translate(text, source, target):
 
     # 150-char chunking to avoid RAM spikes on Streamlit Cloud CPU
    # Change chunking length from 150 to 600
-    chunks = [text[i:i+600] for i in range(0, len(text), 600)]
+    chunks = [text[i:i+1200] for i in range(0, len(text), 1200)]
     results = []
     
     progress_bar = st.progress(0)
