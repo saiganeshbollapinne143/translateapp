@@ -54,7 +54,7 @@ def get_db():
 
 # ================= THREAD ID =================
 if "thread_id" not in st.session_state:
-    st.session_state.thread_id = 306
+    st.session_state.thread_id = 307
 
 # ================= FILE READER =================
 def read_file(file):
