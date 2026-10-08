@@ -1,4 +1,4 @@
-import io, uuid, torch, chromadb, streamlit as st
+import io, uuid, gc, torch, chromadb, streamlit as st
 from datetime import datetime
 from transformers import AutoTokenizer, AutoModelForSeq2SeqLM
 from pypdf import PdfReader
@@ -21,12 +21,18 @@ st.markdown("""
 </style>
 """, unsafe_allow_html=True)
 
-# ================= MODEL =================
+# ================= MODEL LOADING (OOM SAFE) =================
 @st.cache_resource(show_spinner="Loading NLLB model...")
 def load_model():
     device = "cuda" if torch.cuda.is_available() else "cpu"
     tokenizer = AutoTokenizer.from_pretrained(MODEL)
-    model = AutoModelForSeq2SeqLM.from_pretrained(MODEL).to(device)
+    
+    # Load model with minimal RAM footprint
+    model = AutoModelForSeq2SeqLM.from_pretrained(
+        MODEL,
+        torch_dtype=torch.float32 if device == "cpu" else torch.float16
+    ).to(device)
+    
     model.eval()
     return tokenizer, model, device
 
@@ -58,7 +64,7 @@ def read_file(file):
 
     return ""
 
-# ================= TRANSLATION =================
+# ================= TRANSLATION (OOM PROTECTED) =================
 def translate(text, source, target):
     tokenizer, model, device = load_model()
     
@@ -68,28 +74,28 @@ def translate(text, source, target):
     else:
         target_id = tokenizer.convert_tokens_to_ids(target)
 
-    chunks = [text[i:i+300] for i in range(0, len(text), 300)]
+    # 1. Smaller chunk size (150 chars) to prevent context explosion
+    chunks = [text[i:i+150] for i in range(0, len(text), 150)]
     results = []
     
     progress_bar = st.progress(0)
-    batch_size = 4 if device == "cuda" else 1
 
-    for start in range(0, len(chunks), batch_size):
-        batch = chunks[start:start+batch_size]
-
+    # 2. Strict sequential batch size = 1 to conserve RAM
+    for i, chunk in enumerate(chunks):
         inputs = tokenizer(
-            batch,
+            chunk,
             return_tensors="pt",
-            padding=True,
+            padding=False,
             truncation=True,
-            max_length=512
+            max_length=128
         ).to(device)
 
         with torch.inference_mode():
             output = model.generate(
-                **inputs,
+                inputs["input_ids"],
+                attention_mask=inputs.get("attention_mask"),
                 forced_bos_token_id=target_id,
-                max_new_tokens=512,
+                max_new_tokens=128,  # Cap token generation per chunk
                 num_beams=1,
                 do_sample=False
             )
@@ -97,11 +103,18 @@ def translate(text, source, target):
         decoded = tokenizer.batch_decode(output, skip_special_tokens=True)
         results.extend(decoded)
 
-        progress_val = min((start + len(batch)) / len(chunks), 1.0)
-        progress_bar.progress(progress_val)
+        # Update progress bar
+        progress_bar.progress((i + 1) / len(chunks))
 
     progress_bar.empty()
-    return "\n\n".join(results)
+
+    # 3. Aggressive RAM & Cache Cleanup
+    del inputs, output
+    gc.collect()
+    if torch.cuda.is_available():
+        torch.cuda.empty_cache()
+
+    return " ".join(results)
 
 # ================= SAVE HISTORY =================
 def save_history(source, target, original, translated):
