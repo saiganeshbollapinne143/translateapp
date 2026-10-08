@@ -480,4 +480,4 @@ if st.button(
 
         st.success(
             "Translation completed."
-        )s
+        )
