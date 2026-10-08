@@ -53,8 +53,8 @@ def get_db():
 
 # ================= THREAD ID (AUTOMATIC GENERATION) =================
 if "thread_id" not in st.session_state:
-    st.session_state.thread_id = str(uuid.uuid4())[:8]
-
+    st.session_state.thread_id = str(uuid.uuid4())[:8]  #e.g., "e4a1b9c2"
+    st.write(f"Current Thread ID: {st.session_state.thread_id}")
 # ================= FILE READER =================
 def read_file(file):
     data = file.getvalue()
