@@ -184,32 +184,36 @@ source_name = c1.selectbox("Source Language", list(LANG.keys()))
 target_name = c2.selectbox("Target Language", list(LANG.keys()), index=1)
 
 # ================= INPUT SECTION =================
-uploaded = st.file_uploader("📁 Upload TXT / PDF / DOCX", type=["txt", "pdf", "docx"])
-
-input_text = ""
-if uploaded:
-    input_text = read_file(uploaded)
-    if input_text.strip():
-        st.success(f"📄 {uploaded.name} loaded successfully")
-
-text = st.text_area(
+# Text Area stays empty unless typed directly
+input_text = st.text_area(
     "Text to translate",
-    value=input_text,
     height=160,
     placeholder="Type or paste text here..."
 )
 
+uploaded = st.file_uploader("📁 Upload TXT / PDF / DOCX", type=["txt", "pdf", "docx"])
+
+if uploaded:
+    st.success(f"📄 {uploaded.name} loaded successfully")
+
 # ================= TRANSLATE BUTTON =================
 if st.button("🚀 Translate", type="primary", use_container_width=True):
-    if not text.strip():
+    # Determine input source: file prioritized if uploaded, otherwise text box
+    source_text = ""
+    if uploaded:
+        source_text = read_file(uploaded)
+    elif input_text.strip():
+        source_text = input_text
+
+    if not source_text.strip():
         st.warning("Please enter text or upload a valid document.")
     elif source_name == target_name:
         st.warning("Please select different source and target languages.")
     else:
         with st.spinner("Translating..."):
-            result = translate(text, LANG[source_name], LANG[target_name])
+            result = translate(source_text, LANG[source_name], LANG[target_name])
 
-        save_history(source_name, target_name, text, result)
+        save_history(source_name, target_name, source_text, result)
 
         st.success("✅ Translation completed.")
         st.subheader("Translation Result")
