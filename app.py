@@ -200,6 +200,7 @@ def translate_chunk(sents, src, tgt, beam):
             forced_bos_token_id=tok.convert_tokens_to_ids(tgt_code),
             num_beams=beam,
             max_new_tokens=max_new,
+            max_length=None,
         )
     return tok.batch_decode(ids, skip_special_tokens=True)
 
