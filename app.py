@@ -10,18 +10,19 @@ from reportlab.pdfbase import pdfmetrics
 from reportlab.pdfbase.ttfonts import TTFont
 
 # -----------------------------------------------------------------------------
-# SECRETS & CONFIGURATION MANAGEMENT
+# SECRETS MANAGEMENT
 # -----------------------------------------------------------------------------
-# Read UI, environment, and runtime defaults from st.secrets (with fallbacks)
-APP_TITLE = st.secrets.get("APP_TITLE", "AIT GLOBAL TECHNOLOGIES - TRANSLATOR")
+# Safely load secrets from st.secrets with fallback defaults
+HF_TOKEN = st.secrets.get("HF_TOKEN", None)
 COMPANY_NAME = st.secrets.get("COMPANY_NAME", "AIT GLOBAL")
+APP_TITLE = st.secrets.get("APP_TITLE", "AIT GLOBAL TECHNOLOGIES - TRANSLATOR")
 MODEL_NAME = st.secrets.get("MODEL_NAME", "facebook/nllb-200-distilled-600M")
 DEFAULT_BATCH_SIZE = int(st.secrets.get("DEFAULT_BATCH_SIZE", 8))
-API_KEY = st.secrets.get("API_KEY", "")  # Reserved for external endpoints if needed
+API_KEY = st.secrets.get("API_KEY", "")
 
 st.set_page_config(page_title="AI Translator", page_icon="🌍", layout="wide")
 
-# Custom CSS styling matching your original specification
+# Custom CSS styling with dynamic company name from secrets
 st.markdown(
     f"""
 <style>
@@ -49,7 +50,6 @@ st.markdown(
     unsafe_allow_html=True,
 )
 
-# Supported language codes & typography mapping
 LANGS = {
     "English": "eng_Latn",
     "Tamil": "tam_Taml",
@@ -84,17 +84,19 @@ DEFAULT_FONTS = ["arial.ttf", "calibri.ttf", "segoeui.ttf"]
 # -----------------------------------------------------------------------------
 @st.cache_resource
 def load_model():
-    tok = AutoTokenizer.from_pretrained(MODEL_NAME)
-    model = AutoModelForSeq2SeqLM.from_pretrained(MODEL_NAME).eval()
+    # Pass HF_TOKEN from secrets to authenticate model weight downloads
+    tok = AutoTokenizer.from_pretrained(MODEL_NAME, token=HF_TOKEN)
+    model = AutoModelForSeq2SeqLM.from_pretrained(MODEL_NAME, token=HF_TOKEN).eval()
+    
     if torch.cuda.is_available():
         device = "cuda"
         model = model.half().to(device)
     else:
         device = "cpu"
         torch.set_num_threads(os.cpu_count() or 4)
-        model = torch.quantization.quantize_dynamic(
-            model, {torch.nn.Linear}, dtype=torch.qint8
-        )
+        import torch.ao.quantization as ao_quant
+        model = ao_quant.quantize_dynamic(model, {torch.nn.Linear}, dtype=torch.qint8)
+        
     return tok, model, device
 
 def read_file(f):
@@ -102,9 +104,7 @@ def read_file(f):
     if n.endswith(".txt"):
         return data.decode("utf-8-sig", errors="replace")
     if n.endswith(".pdf"):
-        return "\n".join(
-            p.extract_text() or "" for p in PdfReader(io.BytesIO(data)).pages
-        )
+        return "\n".join(p.extract_text() or "" for p in PdfReader(io.BytesIO(data)).pages)
     return "\n".join(p.text for p in Document(io.BytesIO(data)).paragraphs)
 
 def split_sentences(line, max_chars=400):
@@ -112,29 +112,17 @@ def split_sentences(line, max_chars=400):
     for s in re.split(r"(?<=[.!?।。！？؟])\s*", line):
         s = s.strip()
         if s:
-            out += (
-                textwrap.wrap(s, max_chars, break_long_words=False)
-                if len(s) > max_chars
-                else [s]
-            )
+            out += textwrap.wrap(s, max_chars, break_long_words=False) if len(s) > max_chars else [s]
     return out
 
 def translate_stream(text, src, tgt, batch_size, progress_bar):
-    """
-    Translates text line-by-line / batch-by-batch and yields incremental context
-    to power Streamlit's real-time streaming view.
-    """
+    """Yields intermediate translation text line-by-line for real-time streaming."""
     tok, model, device = load_model()
     tok.src_lang = LANGS[src]
     bos = tok.convert_tokens_to_ids(LANGS[tgt])
     lines = text.splitlines()
 
-    units = [
-        (li, s)
-        for li, ln in enumerate(lines)
-        if ln.strip()
-        for s in split_sentences(ln)
-    ]
+    units = [(li, s) for li, ln in enumerate(lines) if ln.strip() for s in split_sentences(ln)]
     if not units:
         yield ""
         return
@@ -172,12 +160,8 @@ def translate_stream(text, src, tgt, batch_size, progress_bar):
         processed += len(idx)
         progress_bar.progress(processed / len(units))
 
-        # Yield current full document status as text streams in
-        current_text = "\n".join(
-            " ".join(rebuilt[i]) if i in rebuilt else ""
-            for i in range(len(lines))
-        )
-        yield current_text
+        # Stream accumulated output
+        yield "\n".join(" ".join(rebuilt[i]) if i in rebuilt else "" for i in range(len(lines)))
 
 def make_pdf(text, lang):
     font = "Helvetica"
@@ -190,18 +174,11 @@ def make_pdf(text, lang):
                 break
             except Exception:
                 pass
-    style = ParagraphStyle(
-        "u",
-        parent=getSampleStyleSheet()["Normal"],
-        fontName=font,
-        fontSize=11,
-        leading=16,
-    )
+    style = ParagraphStyle("u", parent=getSampleStyleSheet()["Normal"], fontName=font, fontSize=11, leading=16)
     rtl = lang == "Arabic"
     if rtl:
         try:
-            import arabic_reshaper
-            from bidi.algorithm import get_display
+            import arabic_reshaper; from bidi.algorithm import get_display
         except ImportError:
             rtl = False
 
@@ -210,12 +187,7 @@ def make_pdf(text, lang):
     for line in text.splitlines():
         if rtl and line.strip():
             line = get_display(arabic_reshaper.reshape(line))
-        safe = (
-            line.replace("&", "&amp;")
-            .replace("<", "&lt;")
-            .replace(">", "&gt;")
-            or " "
-        )
+        safe = line.replace("&", "&amp;").replace("<", "&lt;").replace(">", "&gt;") or " "
         story += [Paragraph(safe, style), Spacer(1, 4)]
     SimpleDocTemplate(out).build(story)
     return out.getvalue()
@@ -239,11 +211,7 @@ source = c1.selectbox("Input language", list(LANGS), index=0)
 target = c2.selectbox("Translate into", list(LANGS), index=1)
 uploaded = st.file_uploader("Upload PDF, TXT, or DOCX", type=["pdf", "txt", "docx"])
 prompt = st.text_area("Or enter text to translate", height=120)
-batch_size = st.select_slider(
-    "Batch size (higher = faster, more RAM)",
-    [4, 8, 16, 32],
-    value=DEFAULT_BATCH_SIZE,
-)
+batch_size = st.select_slider("Batch size (higher = faster, more RAM)", [4, 8, 16, 32], value=DEFAULT_BATCH_SIZE)
 
 if st.button("🚀 Translate", type="primary"):
     text = read_file(uploaded) if uploaded else prompt
@@ -257,20 +225,12 @@ if st.button("🚀 Translate", type="primary"):
                 load_model()
 
             bar = st.progress(0)
-            st.subheader("Live Translation Stream")
             output_container = st.empty()
 
             final_text = ""
-            for partial_translation in translate_stream(
-                text, source, target, batch_size, bar
-            ):
+            for partial_translation in translate_stream(text, source, target, batch_size, bar):
                 final_text = partial_translation
-                output_container.text_area(
-                    "Streaming Result",
-                    value=final_text,
-                    height=250,
-                    key=f"stream_{uuid.uuid4().hex[:6]}",
-                )
+                output_container.text_area("Live Translation Stream", value=final_text, height=250)
 
             bar.empty()
             tid = str(uuid.uuid4())
@@ -286,28 +246,16 @@ if st.button("🚀 Translate", type="primary"):
         except Exception as e:
             st.error(f"Translation failed: {e}")
 
-# Render active translated result & export tools
 if ss.current and ss.current in ss.history:
     rec = ss.history[ss.current]
     st.success(f"Translation completed! Thread ID: `{ss.current}`")
     st.text_area("Final translation", rec["translated"], height=300)
 
     d1, d2, d3 = st.columns(3)
-    d1.download_button(
-        "⬇️ PDF",
-        make_pdf(rec["translated"], rec["target"]),
-        "translation.pdf",
-        "application/pdf",
-    )
-    d2.download_button(
-        "⬇️ DOCX",
-        make_docx(rec["translated"]),
-        "translation.docx",
-        "application/vnd.openxmlformats-officedocument.wordprocessingml.document",
-    )
+    d1.download_button("⬇️ PDF", make_pdf(rec["translated"], rec["target"]), "translation.pdf", "application/pdf")
+    d2.download_button("⬇️ DOCX", make_docx(rec["translated"]), "translation.docx", "application/vnd.openxmlformats-officedocument.wordprocessingml.document")
     d3.download_button("⬇️ TXT", rec["translated"], "translation.txt", "text/plain")
 
-# Session History
 with st.expander("Translation history / import by thread ID"):
     tid_in = st.text_input("Thread ID")
     if st.button("Load thread"):
