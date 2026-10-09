@@ -8,7 +8,7 @@ from transformers import AutoTokenizer, AutoModelForSeq2SeqLM
 
 st.set_page_config(page_title="AIT GLOBAL TECHNOLOGIES", page_icon="🌍", layout="wide")
 st.title("🌍 AIT GLOBAL TECHNOLOGIES")
-st.subheader("AI Document Translator — NLLB-200")
+st.subheader("AI Document Translator")
 
 MODEL = "facebook/nllb-200-distilled-600M"
 CHUNK_TOKENS, MAX_OUTPUT = 400, 384
