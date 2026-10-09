@@ -12,7 +12,7 @@ st.set_page_config(page_title="AIT GLOBAL TECHNOLOGIES", layout="wide")
 st.title("🌐 AIT GLOBAL TECHNOLOGIES — Translator")
 
 MODEL = "facebook/nllb-200-distilled-600M"
-CHUNK_SIZE = 1200
+CHUNK_SIZE = 800
 BATCH_SIZE = 2
 DEVICE = "cuda" if torch.cuda.is_available() else "cpu"
 
