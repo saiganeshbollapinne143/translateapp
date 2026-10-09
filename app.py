@@ -10,149 +10,203 @@ import torch
 from transformers import AutoTokenizer, AutoModelForSeq2SeqLM
 
 # ---------- CONFIG ----------
-st.set_page_config(page_title="AI Translator", page_icon="🌍", layout="wide")
+st.set_page_config(
+    page_title="AIT GLOBAL TECHNOLOGIES",
+    page_icon="🌍",
+    layout="wide"
+)
+
 MODEL_NAME = "facebook/nllb-200-distilled-600M"
+
 LANGS = {
-    "English": "eng_Latn", "Spanish": "spa_Latn",
-    "French": "fra_Latn", "German": "deu_Latn",
-    "Italian": "ita_Latn", "Tamil": "tam_Taml",
-    "Hindi": "hin_Deva", "Kannada": "kan_Knda",
+    "English": "eng_Latn",
+    "Spanish": "spa_Latn",
+    "French": "fra_Latn",
+    "German": "deu_Latn",
+    "Italian": "ita_Latn",
+    "Tamil": "tam_Taml",
+    "Hindi": "hin_Deva",
+    "Kannada": "kan_Knda",
     "Telugu": "tel_Telu"
 }
 
 def ist_now():
-    return datetime.now(ZoneInfo("Asia/Kolkata")).strftime("%d-%m-%Y %I:%M:%S %p IST")
+    return datetime.now(ZoneInfo("Asia/Kolkata")).strftime(
+        "%d-%m-%Y %I:%M:%S %p IST"
+    )
 
-@st.cache_resource(show_spinner="Loading translation model...")
+@st.cache_resource(show_spinner="Translating....")
 def load_model():
     device = "cuda" if torch.cuda.is_available() else "cpu"
     tokenizer = AutoTokenizer.from_pretrained(MODEL_NAME)
     model = AutoModelForSeq2SeqLM.from_pretrained(MODEL_NAME)
+
     if device == "cuda":
         model = model.half()
+
     model.to(device)
     model.eval()
     return tokenizer, model, device
 
 def split_text(text, limit=700):
-    # Split by paragraphs and sentences without cutting ordinary words.
     pieces = re.split(r"(?<=[.!?。！？])\s+|\n+", text.strip())
-    chunks, current = [], ""
+    chunks = []
+    current = ""
+
     for piece in pieces:
         piece = piece.strip()
         if not piece:
             continue
+
         while len(piece) > limit:
             if current:
                 chunks.append(current)
                 current = ""
+
             cut = piece.rfind(" ", 0, limit)
             cut = cut if cut > 0 else limit
             chunks.append(piece[:cut].strip())
             piece = piece[cut:].strip()
+
         candidate = f"{current} {piece}".strip()
-        if len(candidate) > limit and current:
+
+        if current and len(candidate) > limit:
             chunks.append(current)
             current = piece
         else:
             current = candidate
+
     if current:
         chunks.append(current)
+
     return chunks
 
-def translate_chunk(text, src, tgt, tokenizer, model, device):
-    tokenizer.src_lang = src
-    inputs = tokenizer(
-        text, return_tensors="pt", truncation=True, max_length=512
-    ).to(device)
-    target_id = tokenizer.convert_tokens_to_ids(tgt)
-    with torch.inference_mode():
-        output = model.generate(
-            **inputs,
-            forced_bos_token_id=target_id,
-            max_new_tokens=384,
-            num_beams=1,
-            do_sample=False
-        )
-    return tokenizer.batch_decode(output, skip_special_tokens=True)[0]
-
-# ---------- SESSION ----------
+# ---------- SESSION STATE ----------
 if "thread_id" not in st.session_state:
     st.session_state.thread_id = str(uuid.uuid4())
+
 if "history" not in st.session_state:
     st.session_state.history = []
+
+if "last_result" not in st.session_state:
+    st.session_state.last_result = ""
+
+if "last_filename" not in st.session_state:
+    st.session_state.last_filename = "translated.txt"
 
 def new_thread():
     st.session_state.thread_id = str(uuid.uuid4())
     st.session_state.last_result = ""
+    st.session_state.last_filename = "translated.txt"
 
+# ---------- UI ----------
 st.title("🌍 AIT GLOBAL TECHNOLOGIES")
-st.caption("Translate text documents with live chunk progress.")
+st.caption("NLLB-200 AI Translator | Live chunk-by-chunk output")
 
-c1, c2 = st.columns([3, 1])
-with c1:
-    st.write("**Thread ID:**", st.session_state.thread_id)
-with c2:
-    st.button("➕ New Thread", on_click=new_thread, use_container_width=True)
+col1, col2 = st.columns([3, 1])
 
-a, b = st.columns(2)
-with a:
-    source_name = st.selectbox("Source language", list(LANGS), index=0)
-with b:
-    target_name = st.selectbox("Target language", list(LANGS), index=1)
+with col1:
+    st.write("**Thread ID:**")
+    st.code(st.session_state.thread_id)
 
-uploaded = st.file_uploader("Upload a TXT document", type=["txt"])
-prompt = st.text_input(
-    "Translation notes (saved in history)",
-    placeholder="e.g. Preserve headings and use formal business language"
+with col2:
+    st.button(
+        "➕ New Thread",
+        on_click=new_thread,
+        use_container_width=True
+    )
+
+col1, col2 = st.columns(2)
+
+with col1:
+    source_name = st.selectbox(
+        "Source language",
+        list(LANGS.keys()),
+        index=0
+    )
+
+with col2:
+    target_name = st.selectbox(
+        "Target language",
+        list(LANGS.keys()),
+        index=1
+    )
+
+uploaded = st.file_uploader(
+    "Upload a TXT document",
+    type=["txt"]
 )
-manual_text = st.text_area("Or paste text here", height=180)
+
+manual_text = st.text_area(
+    "Enter or paste text to translate",
+    height=180,
+    placeholder="Paste your document text here..."
+)
 
 batch_size = st.select_slider(
     "Processing batch size",
     options=[1, 2, 3, 4],
     value=1,
-    help="Larger batches may be faster but use more memory."
+    help="Use 1 for frequent updates and lower memory use."
 )
 
 text_input = manual_text
 filename = "pasted_text.txt"
+
 if uploaded is not None:
     try:
         text_input = uploaded.getvalue().decode("utf-8-sig")
         filename = uploaded.name
     except UnicodeDecodeError:
-        st.error("This TXT file is not UTF-8 encoded. Save it as UTF-8 and upload again.")
         text_input = ""
+        st.error("Please save the TXT file as UTF-8 and upload it again.")
 
-if st.button("🚀 Translate", type="primary", use_container_width=True):
+# ---------- TRANSLATION ----------
+if st.button(
+    "🚀 Translate",
+    type="primary",
+    use_container_width=True
+):
     if not text_input.strip():
-        st.warning("Upload a TXT file or paste text first.")
+        st.warning("Upload a TXT document or paste text first.")
+
     elif source_name == target_name:
-        st.warning("Choose two different languages.")
+        st.warning("Choose different source and target languages.")
+
     else:
         try:
             tokenizer, model, device = load_model()
             chunks = split_text(text_input)
+
             if not chunks:
-                st.warning("No translatable text was found.")
+                st.warning("No text found to translate.")
                 st.stop()
 
-            st.info(f"Device: {device.upper()} · Chunks: {len(chunks)}")
+            st.info(
+                f"Device: {device.upper()} | "
+                f"Total chunks: {len(chunks)}"
+            )
+
             progress = st.progress(0)
             status = st.empty()
-            live_output = st.empty()
+            output_box = st.empty()
+
             translated_parts = []
             start = time.time()
 
             for start_idx in range(0, len(chunks), batch_size):
                 batch = chunks[start_idx:start_idx + batch_size]
-                # Batch inputs for fewer generation calls.
+
                 tokenizer.src_lang = LANGS[source_name]
+
                 encoded = tokenizer(
-                    batch, return_tensors="pt", padding=True,
-                    truncation=True, max_length=512
+                    batch,
+                    return_tensors="pt",
+                    padding=True,
+                    truncation=True,
+                    max_length=512
                 ).to(device)
+
                 with torch.inference_mode():
                     generated = model.generate(
                         **encoded,
@@ -163,61 +217,92 @@ if st.button("🚀 Translate", type="primary", use_container_width=True):
                         num_beams=1,
                         do_sample=False
                     )
+
                 translated_parts.extend(
-                    tokenizer.batch_decode(generated, skip_special_tokens=True)
+                    tokenizer.batch_decode(
+                        generated,
+                        skip_special_tokens=True
+                    )
                 )
 
-                done = len(translated_parts)
-                progress.progress(done / len(chunks))
-                status.write(f"Translating chunk {done}/{len(chunks)}…")
-                live_output.text_area(
-                    "Translation in progress",
-                    "\n\n".join(translated_parts),
-                    height=220,
-                    key=f"live_{st.session_state.thread_id}_{start_idx}"
+                completed = len(translated_parts)
+                current_output = "\n\n".join(translated_parts)
+
+                # Show translated text after each completed batch
+                with output_box.container():
+                    st.text_area(
+                        "🔄 Streaming Translation",
+                        value=current_output,
+                        height=280
+                    )
+
+                progress.progress(
+                    min(completed / len(chunks), 1.0)
+                )
+
+                status.info(
+                    f"Translating: {completed}/{len(chunks)} "
+                    f"chunks completed"
                 )
 
             result = "\n\n".join(translated_parts)
             duration = round(time.time() - start, 2)
+
             st.session_state.last_result = result
+            st.session_state.last_filename = (
+                f"translated_{LANGS[target_name]}.txt"
+            )
+
             st.session_state.history.insert(0, {
                 "thread": st.session_state.thread_id,
                 "file": filename,
                 "source": source_name,
                 "target": target_name,
-                "prompt": prompt,
                 "chunks": len(chunks),
                 "seconds": duration,
                 "time": ist_now()
             })
-            status.success(f"Translation completed in {duration} seconds.")
-            st.rerun()
+
+            progress.progress(1.0)
+            status.success(
+                f"✅ Translation completed in {duration} seconds."
+            )
 
         except Exception as e:
             st.error(f"Translation failed: {e}")
-            st.exception(e)
 
-if st.session_state.get("last_result"):
+# ---------- FINAL RESULT ----------
+if st.session_state.last_result:
     st.subheader("✅ Translated Document")
-    st.text_area("Final translation", st.session_state.last_result, height=300)
+
+    st.text_area(
+        "Final translation",
+        value=st.session_state.last_result,
+        height=300,
+        key="final_translation"
+    )
+
     st.download_button(
         "📥 Download translated TXT",
         data=st.session_state.last_result.encode("utf-8"),
-        file_name=f"translated_{LANGS[target_name]}.txt",
+        file_name=st.session_state.last_filename,
         mime="text/plain",
         use_container_width=True
     )
 
+# ---------- HISTORY ----------
 with st.expander("🕘 Translation History"):
     if st.session_state.history:
         for item in st.session_state.history:
             st.markdown(
                 f"**{item['source']} → {item['target']}** | "
-                f"{item['file']} | {item['seconds']} sec"
+                f"{item['file']} | {item['seconds']} seconds"
             )
+
             st.caption(
-                f"Thread: {item['thread']} · Chunks: {item['chunks']} · "
-                f"{item['time']} · Notes: {item['prompt'] or 'None'}"
+                f"Thread: {item['thread']} | "
+                f"Chunks: {item['chunks']} | "
+                f"Completed: {item['time']}"
             )
     else:
         st.caption("No translations yet.")
