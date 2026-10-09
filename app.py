@@ -1,6 +1,7 @@
 import io, uuid, time, os, json, re
 from datetime import datetime
 from xml.sax.saxutils import escape
+import requests
 import streamlit as st
 import torch
 from transformers import AutoTokenizer, AutoModelForSeq2SeqLM
@@ -155,6 +156,21 @@ def apply_preset():
     if tpl is not None:
         st.session_state.template = tpl
 
+def llm_translate(prompt, api_key, model_name):
+    """Send the full prompt (instructions + chunk) to Groq and return the reply."""
+    for attempt in range(3):
+        r = requests.post("https://api.groq.com/openai/v1/chat/completions",
+                          headers={"Authorization": f"Bearer {api_key}"},
+                          json={"model": model_name, "temperature": 0.2, "max_tokens": 4096,
+                                "messages": [{"role": "user", "content": prompt}]},
+                          timeout=120)
+        if r.status_code == 429:
+            time.sleep(5 * (attempt + 1)); continue
+        if not r.ok:
+            raise RuntimeError(f"Groq error {r.status_code}: {r.text[:300]}")
+        return r.json()["choices"][0]["message"]["content"].strip()
+    raise RuntimeError("Groq rate limit reached. Wait a moment and try again.")
+
 def load_prompt_file():
     f = st.session_state.get("prompt_file")
     if f is None: return
@@ -185,6 +201,14 @@ with st.sidebar:
     st.header("⚙️ Translation settings")
     source = st.selectbox("Translate from", list(LANGS), index=list(LANGS).index("English"), key="source")
     target = st.selectbox("Translate to", list(LANGS), index=list(LANGS).index("Tamil"), key="target")
+    engine = st.radio("Translation engine", ["NLLB (local)", "LLM (Groq) - follows your prompt"], key="engine")
+    use_llm = engine.startswith("LLM")
+    if use_llm:
+        api_key = st.text_input("Groq API key", type="password", value=os.environ.get("GROQ_API_KEY", ""), key="groq_key")
+        llm_model = st.text_input("Groq model", value="llama-3.3-70b-versatile", key="groq_model")
+        st.caption("Tip: set Chunk size to about 2500 for the LLM.")
+    else:
+        api_key, llm_model = "", ""
     chunk_size = st.slider("Chunk size", 300, 2500, 800, 100, key="chunk")
     max_tokens = st.slider("Maximum output tokens", 128, 512, 256, 32, key="tokens")
     st.subheader("🧩 Prompt & system")
@@ -299,22 +323,28 @@ if st.button("🚀 TRANSLATE & PREPARE PDF", type="primary", key="translate", us
     if not text_input.strip(): st.warning("Upload a PDF/DOCX/TXT file or enter some text.")
     elif source == target: st.warning("Choose different source and target languages.")
     elif "{text}" not in tpl: st.warning("Prompt template must contain {text}.")
+    elif use_llm and not api_key.strip(): st.warning("Enter your Groq API key in the sidebar.")
     else:
         try:
             started = time.time()
             progress = st.progress(0, text="Loading NLLB-200 model...")
             status = st.empty()
-            tok, model = load_model()
-            tok.src_lang = LANGS[source]
-            final_text = tpl.replace("{text}", text_input)
-            chunks = split_chunks(final_text, chunk_size)
+            if use_llm:
+                chunks = split_chunks(text_input, chunk_size)   # prompt is applied to each chunk
+            else:
+                tok, model = load_model()
+                tok.src_lang = LANGS[source]
+                chunks = split_chunks(tpl.replace("{text}", text_input), chunk_size)
             results = []
             for i, chunk in enumerate(chunks):
-                inputs = tok(chunk, return_tensors="pt", truncation=True, max_length=512)
-                with torch.inference_mode():
-                    ids = model.generate(**inputs, forced_bos_token_id=tok.convert_tokens_to_ids(LANGS[target]),
-                                         max_new_tokens=max_tokens, num_beams=1, do_sample=False)
-                results.append(tok.batch_decode(ids, skip_special_tokens=True)[0])
+                if use_llm:
+                    results.append(llm_translate(tpl.replace("{text}", chunk), api_key.strip(), llm_model.strip()))
+                else:
+                    inputs = tok(chunk, return_tensors="pt", truncation=True, max_length=512)
+                    with torch.inference_mode():
+                        ids = model.generate(**inputs, forced_bos_token_id=tok.convert_tokens_to_ids(LANGS[target]),
+                                             max_new_tokens=max_tokens, num_beams=1, do_sample=False)
+                    results.append(tok.batch_decode(ids, skip_special_tokens=True)[0])
                 progress.progress((i + 1) / len(chunks), text=f"Translating chunk {i+1}/{len(chunks)}")
                 status.markdown("**Live translation:**\n\n" + "\n\n".join(results))
             st.session_state.translated = "\n\n".join(results)
