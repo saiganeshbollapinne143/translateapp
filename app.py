@@ -10,7 +10,7 @@ from transformers import AutoTokenizer, AutoModelForSeq2SeqLM
 
 st.set_page_config(page_title="AIT GLOBAL TECHNOLOGIES", layout="wide")
 st.title("AIT GLOBAL TECHNOLOGIES")
-st.subheader("AIT GLOBAL TECHNOLOGIES")
+
 
 MODEL = "facebook/nllb-200-distilled-600M"
 
