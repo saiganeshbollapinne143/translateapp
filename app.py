@@ -1,6 +1,8 @@
 import io, os, re, uuid, textwrap
 from datetime import datetime
-import streamlit as st, torch
+import streamlit as st
+import torch
+import chromadb
 from transformers import AutoTokenizer, AutoModelForSeq2SeqLM
 from pypdf import PdfReader
 from docx import Document
@@ -16,7 +18,7 @@ HF_TOKEN = st.secrets.get("HF_TOKEN", None)
 COMPANY_NAME = st.secrets.get("COMPANY_NAME", "AIT GLOBAL")
 APP_TITLE = st.secrets.get("APP_TITLE", "AIT GLOBAL TECHNOLOGIES - TRANSLATOR")
 MODEL_NAME = st.secrets.get("MODEL_NAME", "facebook/nllb-200-distilled-600M")
-DEFAULT_BATCH_SIZE = int(st.secrets.get("DEFAULT_BATCH_SIZE", 8))
+DEFAULT_BATCH_SIZE = int(st.secrets.get("DEFAULT_BATCH_SIZE", 16))
 
 st.set_page_config(page_title="AI Translator", page_icon="🌍", layout="wide")
 
@@ -92,8 +94,15 @@ FONTS = {
 DEFAULT_FONTS = ["arial.ttf", "calibri.ttf", "segoeui.ttf"]
 
 # -----------------------------------------------------------------------------
-# HELPER FUNCTIONS
+# CHROMADB & MODEL INITIALIZATION
 # -----------------------------------------------------------------------------
+@st.cache_resource
+def get_chroma_collection():
+    """Initializes local ChromaDB client and collection for recording history."""
+    client = chromadb.PersistentClient(path="./chroma_db")
+    collection = client.get_or_create_collection(name="translation_history")
+    return collection
+
 @st.cache_resource
 def load_model():
     tok = AutoTokenizer.from_pretrained(MODEL_NAME, token=HF_TOKEN)
@@ -103,13 +112,22 @@ def load_model():
     
     if torch.cuda.is_available():
         device = "cuda"
-        model = model.half().to(device)
+        model = model.to(device=device, dtype=torch.float16)
+        # Apply PyTorch optimization if supported
+        if hasattr(torch, "compile"):
+            try:
+                model = torch.compile(model)
+            except Exception:
+                pass
     else:
         device = "cpu"
-        torch.set_num_threads(2)
+        torch.set_num_threads(os.cpu_count() or 4)
         
     return tok, model, device
 
+# -----------------------------------------------------------------------------
+# HELPER FUNCTIONS
+# -----------------------------------------------------------------------------
 def read_file(f):
     """Extracts text while maintaining structural dividers and spacing."""
     data, n = f.getvalue(), f.name.lower()
@@ -139,7 +157,8 @@ def is_structural_line(line):
         return True
     return False
 
-def split_sentences(line, max_chars=400):
+def split_sentences(line, max_chars=512):
+    """Splits text into chunks optimized for translation context length."""
     out = []
     for s in re.split(r"(?<=[.!?।。！？؟])\s*", line):
         s = s.strip()
@@ -148,7 +167,7 @@ def split_sentences(line, max_chars=400):
     return out
 
 def translate_stream(text, src, tgt, batch_size, progress_bar):
-    """Translates content line-by-line while keeping structural layouts exact."""
+    """Batches translation units efficiently while yielding structured progress."""
     tok, model, device = load_model()
     tok.src_lang = LANGS[src]
     
@@ -158,34 +177,45 @@ def translate_stream(text, src, tgt, batch_size, progress_bar):
         bos = tok.convert_tokens_to_ids(LANGS[tgt])
         
     lines = text.splitlines()
-    translated_lines = []
-
+    translated_lines = [None] * len(lines)
+    
+    # Collect batch processing units
+    batch_units = []
     for idx, line in enumerate(lines):
         if is_structural_line(line):
-            translated_lines.append(line)
-            progress_bar.progress((idx + 1) / len(lines))
-            yield "\n".join(translated_lines)
-            continue
+            translated_lines[idx] = line
+        else:
+            prefix = ""
+            content = line
+            bullet_match = re.match(r"^(\s*[-•*]\s*)(.*)", line)
+            if bullet_match:
+                prefix = bullet_match.group(1)
+                content = bullet_match.group(2)
+            
+            sentences = split_sentences(content)
+            batch_units.append((idx, prefix, sentences))
 
-        # Handle hyphenated list items
-        prefix = ""
-        content = line
-        bullet_match = re.match(r"^(\s*[-•*]\s*)(.*)", line)
-        if bullet_match:
-            prefix = bullet_match.group(1)
-            content = bullet_match.group(2)
+    total_units = len(batch_units) if batch_units else 1
+    processed_count = 0
 
-        sentences = split_sentences(content)
-        line_outs = []
+    # Batch process content for GPU pipeline saturation
+    for i in range(0, len(batch_units), batch_size):
+        chunk = batch_units[i : i + batch_size]
+        flat_sentences = []
+        sentence_map = []  # Maps flat index to (chunk_item_index)
 
-        for start in range(0, len(sentences), batch_size):
-            batch = sentences[start : start + batch_size]
+        for item_idx, (_, _, sentences) in enumerate(chunk):
+            for s in sentences:
+                flat_sentences.append(s)
+                sentence_map.append(item_idx)
+
+        if flat_sentences:
             enc = tok(
-                batch,
+                flat_sentences,
                 return_tensors="pt",
                 padding=True,
                 truncation=True,
-                max_length=256,
+                max_length=512,
             ).to(device)
 
             with torch.inference_mode():
@@ -193,18 +223,57 @@ def translate_stream(text, src, tgt, batch_size, progress_bar):
                     **enc,
                     forced_bos_token_id=bos,
                     num_beams=1,
-                    max_new_tokens=int(enc["input_ids"].shape[1] * 1.6) + 10,
+                    max_new_tokens=512,
                 )
 
             decoded = tok.batch_decode(ids, skip_special_tokens=True)
-            line_outs.extend(decoded)
 
-        translated_lines.append(prefix + " ".join(line_outs))
-        progress_bar.progress((idx + 1) / len(lines))
-        yield "\n".join(translated_lines)
+            # Reconstruct batch items
+            reconstructed = [[] for _ in chunk]
+            for dec_text, chunk_item_idx in zip(decoded, sentence_map):
+                reconstructed[chunk_item_idx].append(dec_text)
+
+            for item_idx, (orig_line_idx, prefix, _) in enumerate(chunk):
+                translated_lines[orig_line_idx] = prefix + " ".join(reconstructed[item_idx])
+
+        processed_count += len(chunk)
+        progress_bar.progress(min(1.0, processed_count / total_units))
+        
+        # Stream intermediate current text state
+        yield "\n".join([line if line is not None else "" for line in translated_lines])
+
+def save_to_chroma(thread_id, source, target, original, translated):
+    """Automatically records translation details into ChromaDB."""
+    collection = get_chroma_collection()
+    timestamp = datetime.now().strftime("%Y-%m-%d %H:%M:%S")
+    collection.add(
+        documents=[translated],
+        metadatas=[{
+            "timestamp": timestamp,
+            "source_lang": source,
+            "target_lang": target,
+            "original_text": original[:1000] # Store preview snippet
+        }],
+        ids=[thread_id]
+    )
+
+def fetch_from_chroma(thread_id):
+    """Retrieves record details from ChromaDB by Thread ID."""
+    collection = get_chroma_collection()
+    res = collection.get(ids=[thread_id])
+    if res and res["ids"]:
+        return {
+            "translated": res["documents"][0],
+            "metadata": res["metadatas"][0]
+        }
+    return None
+
+def fetch_all_chroma_records():
+    """Retrieves all past translation records from ChromaDB."""
+    collection = get_chroma_collection()
+    return collection.get()
 
 def get_registered_font(lang):
-    """Embeds Unicode-capable TTF font for clean French accent rendering."""
     candidate_fonts = [
         "/usr/share/fonts/truetype/dejavu/DejaVuSans.ttf",
         "/usr/share/fonts/truetype/liberation/LiberationSans-Regular.ttf",
@@ -221,7 +290,6 @@ def get_registered_font(lang):
     return "Helvetica"
 
 def make_pdf(text, lang):
-    """Outputs a clean PDF matching the plain-text/doc layout structure."""
     font_name = get_registered_font(lang)
 
     style = ParagraphStyle(
@@ -284,15 +352,15 @@ def make_docx(text):
 # INTERFACE & INTERACTION
 # -----------------------------------------------------------------------------
 ss = st.session_state
-ss.setdefault("history", {})
-ss.setdefault("current", None)
+ss.setdefault("current_thread_id", None)
+ss.setdefault("current_record", None)
 
 c1, c2 = st.columns(2)
 source = c1.selectbox("Input language", list(LANGS), index=0)
 target = c2.selectbox("Translate into", list(LANGS), index=1)
 uploaded = st.file_uploader("Upload PDF, TXT, or DOCX", type=["pdf", "txt", "docx"])
 prompt = st.text_area("Or enter text to translate", height=120)
-batch_size = st.select_slider("Batch size (higher = faster, more RAM)", [4, 8, 16, 32], value=DEFAULT_BATCH_SIZE)
+batch_size = st.select_slider("Batch size (higher = faster, more GPU RAM)", [4, 8, 16, 32, 64], value=DEFAULT_BATCH_SIZE)
 
 if st.button("🚀 Translate", type="primary"):
     text = read_file(uploaded) if uploaded else prompt
@@ -302,7 +370,7 @@ if st.button("🚀 Translate", type="primary"):
         st.warning("Choose different input and output languages.")
     else:
         try:
-            with st.spinner("Loading NLLB-200 model..."):
+            with st.spinner("Initializing accelerated translation pipeline..."):
                 load_model()
 
             bar = st.progress(0)
@@ -317,38 +385,48 @@ if st.button("🚀 Translate", type="primary"):
                 )
 
             bar.empty()
-            tid = str(uuid.uuid4())
-            ss.history[tid] = {
-                "time": datetime.now().strftime("%Y-%m-%d %H:%M:%S"),
-                "source": source,
-                "target": target,
-                "original": text,
+            
+            # Auto-generate System Thread ID and save to ChromaDB
+            auto_thread_id = f"TR-{uuid.uuid4().hex[:10].upper()}"
+            save_to_chroma(auto_thread_id, source, target, text, final_text)
+            
+            ss.current_thread_id = auto_thread_id
+            ss.current_record = {
                 "translated": final_text,
+                "target": target
             }
-            ss.current = tid
             st.rerun()
         except Exception as e:
             st.error(f"Translation failed: {e}")
 
-if ss.current and ss.current in ss.history:
-    rec = ss.history[ss.current]
-    st.success(f"Translation completed! Thread ID: `{ss.current}`")
-    st.text_area("Final translation", rec["translated"], height=300)
+if ss.current_thread_id and ss.current_record:
+    st.success(f"Translation completed & persisted to ChromaDB! System Thread ID: `{ss.current_thread_id}`")
+    st.text_area("Final translation", ss.current_record["translated"], height=300)
 
     d1, d2, d3 = st.columns(3)
-    d1.download_button("⬇️ PDF", make_pdf(rec["translated"], rec["target"]), "translation.pdf", "application/pdf")
-    d2.download_button("⬇️ DOCX", make_docx(rec["translated"]), "translation.docx", "application/vnd.openxmlformats-officedocument.wordprocessingml.document")
-    d3.download_button("⬇️ TXT", rec["translated"], "translation.txt", "text/plain")
+    d1.download_button("⬇️ PDF", make_pdf(ss.current_record["translated"], ss.current_record["target"]), "translation.pdf", "application/pdf")
+    d2.download_button("⬇️ DOCX", make_docx(ss.current_record["translated"]), "translation.docx", "application/vnd.openxmlformats-officedocument.wordprocessingml.document")
+    d3.download_button("⬇️ TXT", ss.current_record["translated"], "translation.txt", "text/plain")
 
-with st.expander("Translation history / import by thread ID"):
-    tid_in = st.text_input("Thread ID")
+with st.expander("ChromaDB Translation History / Search Thread ID"):
+    tid_in = st.text_input("Enter System Thread ID")
     if st.button("Load thread"):
-        if tid_in.strip() in ss.history:
-            ss.current = tid_in.strip()
-            st.rerun()
-        else:
-            st.warning("Thread ID not found in this session.")
-    for t, r in reversed(list(ss.history.items())):
-        st.write(f"`{t}` — {r['time']} — {r['source']} → {r['target']}")
-    if not ss.history:
-        st.write("No translations yet.")
+        if tid_in.strip():
+            record = fetch_from_chroma(tid_in.strip())
+            if record:
+                ss.current_thread_id = tid_in.strip()
+                ss.current_record = {
+                    "translated": record["translated"],
+                    "target": record["metadata"]["target_lang"]
+                }
+                st.rerun()
+            else:
+                st.warning("Thread ID not found in ChromaDB database.")
+                
+    st.subheader("Saved Records")
+    records = fetch_all_chroma_records()
+    if records and records["ids"]:
+        for tid, meta in zip(records["ids"], records["metadatas"]):
+            st.write(f"`{tid}` — {meta.get('timestamp', 'N/A')} — {meta.get('source_lang', '')} → {meta.get('target_lang', '')}")
+    else:
+        st.write("No translation records stored in ChromaDB yet.")
