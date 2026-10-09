@@ -9,7 +9,7 @@ from reportlab.lib.styles import getSampleStyleSheet
 from reportlab.lib.pagesizes import A4
 
 st.set_page_config(page_title="AI Translator", layout="wide")
-st.title("🌍 NLLB-200 Document Translator")
+st.title("🌍 AIT GLOBAL Document Translator")
 MODEL = "facebook/nllb-200-distilled-600M"
 LANGS = {"English":"eng_Latn","Tamil":"tam_Taml","Hindi":"hin_Deva","Telugu":"tel_Telu","Malayalam":"mal_Mlym","Kannada":"kan_Knda","French":"fra_Latn","German":"deu_Latn","Spanish":"spa_Latn","Arabic":"arb_Arab","Chinese":"zho_Hans","Japanese":"jpn_Jpan","Portuguese":"por_Latn","Russian":"rus_Cyrl","Bengali":"ben_Beng","Urdu":"urd_Arab"}
 
