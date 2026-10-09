@@ -75,7 +75,7 @@ def read_file(f):
 def translate_text(text, src, dst, tok, model, bar):
     tok.src_lang = LANG[src]
     words = text.split()
-    chunks = [" ".join(words[i:i+160]) for i in range(0, len(words), 160)]
+    chunks = [" ".join(words[i:i+800]) for i in range(0, len(words), 800)]
     output = []
     if not chunks:
         return ""
