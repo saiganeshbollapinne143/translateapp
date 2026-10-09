@@ -1,5 +1,6 @@
 
 import uuid
+import re
 from datetime import datetime
 from zoneinfo import ZoneInfo
 
@@ -7,141 +8,217 @@ import streamlit as st
 import torch
 from transformers import AutoTokenizer, AutoModelForSeq2SeqLM
 
-st.set_page_config(page_title="AI Translator", layout="wide")
-st.title("🌍 NLLB-200 Document Translator")
+st.set_page_config(page_title="AIT GLOBAL TECHNOLOGIES", layout="wide")
+st.title("AIT GLOBAL TECHNOLOGIES")
+st.subheader("AIT GLOBAL TECHNOLOGIES")
 
 MODEL = "facebook/nllb-200-distilled-600M"
+
+# Priority languages only
 LANGS = {
-    "English": "eng_Latn", "Spanish": "spa_Latn",
-    "Tamil": "tam_Taml", "Hindi": "hin_Deva",
-    "Italian": "ita_Latn", "French": "fra_Latn",
-    "German": "deu_Latn", "Portuguese": "por_Latn",
-    "Arabic": "arb_Arab", "Chinese": "zho_Hans"
+    "Spanish": "spa_Latn",
+    "French": "fra_Latn",
+    "German": "deu_Latn",
+    "Italian": "ita_Latn",
+    "Tamil": "tam_Taml",
+    "Hindi": "hin_Deva",
+    "English": "eng_Latn",
+    "Kannada": "kan_Knda"
 }
 
 @st.cache_resource(show_spinner="Loading translation model...")
 def load_model():
-    tok = AutoTokenizer.from_pretrained(MODEL)
-    net = AutoModelForSeq2SeqLM.from_pretrained(MODEL)
     device = "cuda" if torch.cuda.is_available() else "cpu"
-    net.to(device)
-    net.eval()
-    return tok, net, device
+    tokenizer = AutoTokenizer.from_pretrained(MODEL)
+    model = AutoModelForSeq2SeqLM.from_pretrained(MODEL)
+    model.to(device).eval()
+    return tokenizer, model, device
 
+def now_ist():
+    return datetime.now(ZoneInfo("Asia/Kolkata"))
+
+# Session initialization
 if "thread_id" not in st.session_state:
     st.session_state.thread_id = str(uuid.uuid4())
-if "translated_text" not in st.session_state:
-    st.session_state.translated_text = ""
+if "result" not in st.session_state:
+    st.session_state.result = ""
 if "history" not in st.session_state:
     st.session_state.history = []
+if "prompt" not in st.session_state:
+    st.session_state.prompt = ""
+if "notice" not in st.session_state:
+    st.session_state.notice = ""
 
-now = datetime.now(ZoneInfo("Asia/Kolkata"))
-st.caption(f"📅 Date: {now:%d-%m-%Y} | 🕒 Time: {now:%I:%M:%S %p} IST")
-st.caption(f"🧵 Thread ID: {st.session_state.thread_id}")
+def reset_app():
+    st.session_state.prompt = ""
+    st.session_state.result = ""
+    st.session_state.notice = "Prompt and translation reset."
 
-if st.button("🆕 New Thread"):
+def new_thread():
     st.session_state.thread_id = str(uuid.uuid4())
-    st.session_state.translated_text = ""
-    st.session_state.history = []
-    st.rerun()
+    st.session_state.prompt = ""
+    st.session_state.result = ""
+    st.session_state.notice = "New thread created."
 
-prompt = st.text_area(
-    "✍️ Translation prompt",
-    "Translate accurately into the selected target language. "
-    "Preserve meaning, names, numbers, headings and paragraphs.",
-    height=100
-)
+now = now_ist()
+st.caption(f"Date: {now:%d-%m-%Y} | Time: {now:%I:%M:%S %p} IST")
+st.caption(f"Thread ID: {st.session_state.thread_id}")
+
+b1, b2 = st.columns(2)
+with b1:
+    st.button("🔄 Reset", on_click=reset_app,
+              use_container_width=True)
+with b2:
+    st.button("🆕 New Thread", on_click=new_thread,
+              use_container_width=True)
+
+if st.session_state.notice:
+    st.info(st.session_state.notice)
+    st.session_state.notice = ""
+
+st.divider()
 
 c1, c2 = st.columns(2)
 with c1:
-    src = st.selectbox("Source language", list(LANGS))
+    src = st.selectbox("Source Language", list(LANGS), index=6)
 with c2:
-    dst = st.selectbox("Target language", list(LANGS), index=1)
+    dst = st.selectbox("Target Language", list(LANGS), index=0)
 
-file = st.file_uploader("📄 Upload TXT document", type=["txt"])
+st.text_area(
+    "✍️ Translation Prompt",
+    key="prompt",
+    height=100,
+    placeholder=(
+        "Example: Use formal business language. "
+        "Preserve names, numbers, and technical terms."
+    ),
+    help="NLLB-200 does not reliably follow custom instructions. "
+         "This field records your preferences but does not directly "
+         "control the model."
+)
 
-st.subheader("📄 Live Translation Output")
-output = st.empty()
-output.text_area("Translated text", value=st.session_state.translated_text,
-                 height=500, key="initial_output")
+uploaded_file = st.file_uploader(
+    "📄 Upload TXT Document",
+    type=["txt"]
+)
 
-if st.button("🚀 Translate Document", type="primary"):
-    if file is None:
-        st.warning("Upload a TXT file first.")
+if st.button("🚀 Translate Document", type="primary",
+             use_container_width=True):
+    if uploaded_file is None:
+        st.warning("Please upload a TXT document.")
     elif src == dst:
-        st.warning("Select different languages.")
-    elif not prompt.strip():
-        st.warning("Enter a translation prompt.")
+        st.warning("Please select different source and target languages.")
     else:
-        text = file.getvalue().decode("utf-8", errors="replace").strip()
+        text = uploaded_file.getvalue().decode(
+            "utf-8-sig", errors="replace"
+        ).strip()
+
         if not text:
-            st.error("The file is empty.")
+            st.error("The uploaded document is empty.")
         else:
             try:
-                tok, net, device = load_model()
-                tok.src_lang = LANGS[src]
-                target_id = tok.convert_tokens_to_ids(LANGS[dst])
+                tokenizer, model, device = load_model()
+                tokenizer.src_lang = LANGS[src]
+                target_id = tokenizer.convert_tokens_to_ids(LANGS[dst])
 
-                words, chunks, buf = text.split(), [], []
-                size = 0
-                for word in words:
-                    if size + len(word) + 1 > 850 and buf:
-                        chunks.append(" ".join(buf))
-                        buf, size = [], 0
-                    buf.append(word)
-                    size += len(word) + 1
-                if buf:
-                    chunks.append(" ".join(buf))
+                sentences = re.split(r"(?<=[.!?。！？])\s+", text)
+                chunks = []
+                buffer = ""
 
-                results = []
+                for sentence in sentences:
+                    if len(buffer) + len(sentence) > 700 and buffer:
+                        chunks.append(buffer)
+                        buffer = ""
+                    buffer = (buffer + " " + sentence).strip()
+
+                if buffer:
+                    chunks.append(buffer)
+
+                translated_parts = []
                 progress = st.progress(0)
                 status = st.empty()
                 live = st.empty()
 
                 for i, chunk in enumerate(chunks):
-                    status.write(f"Translating {i+1}/{len(chunks)}...")
-                    inputs = tok(chunk, return_tensors="pt",
-                                 truncation=True, max_length=512).to(device)
+                    status.info(
+                        f"Translating part {i + 1}/{len(chunks)} "
+                        f"on {device.upper()}..."
+                    )
+
+                    inputs = tokenizer(
+                        chunk,
+                        return_tensors="pt",
+                        truncation=True,
+                        max_length=512
+                    ).to(device)
 
                     with torch.inference_mode():
-                        generated = net.generate(
+                        output = model.generate(
                             **inputs,
                             forced_bos_token_id=target_id,
-                            max_new_tokens=256,
-                            num_beams=1
+                            max_new_tokens=384,
+                            num_beams=2
                         )
 
-                    results.append(tok.decode(
-                        generated[0], skip_special_tokens=True))
-                    st.session_state.translated_text = "\n\n".join(results)
-                    live.text_area("Translation in progress",
-                                   value=st.session_state.translated_text,
-                                   height=500, key=f"live_{i}")
+                    translated = tokenizer.decode(
+                        output[0], skip_special_tokens=True
+                    )
+                    translated_parts.append(translated)
+                    st.session_state.result = "\n\n".join(
+                        translated_parts
+                    )
+
+                    live.text_area(
+                        "📄 Live Translation",
+                        value=st.session_state.result,
+                        height=220,
+                        key=f"live_{st.session_state.thread_id}_{i}"
+                    )
                     progress.progress((i + 1) / len(chunks))
 
-                completed = datetime.now(ZoneInfo("Asia/Kolkata"))
+                completed = now_ist()
                 st.session_state.history.append({
-                    "thread_id": st.session_state.thread_id,
-                    "source": src, "target": dst,
-                    "date_time": completed.isoformat(),
-                    "file": file.name
+                    "Thread ID": st.session_state.thread_id,
+                    "File": uploaded_file.name,
+                    "Source": src,
+                    "Target": dst,
+                    "Parts": len(chunks),
+                    "Device": device,
+                    "Prompt": st.session_state.prompt,
+                    "Completed": completed.strftime(
+                        "%d-%m-%Y %I:%M:%S %p IST"
+                    )
                 })
-                status.success(f"Completed at {completed:%d-%m-%Y %I:%M:%S %p} IST")
 
-            except Exception as e:
-                st.error(f"{type(e).__name__}: {e}")
+                # Clear prompt after successful translation
+                st.session_state.prompt = ""
+                status.success("✅ Translation completed!")
 
-if st.session_state.translated_text:
+            except Exception as error:
+                st.error(f"{type(error).__name__}: {error}")
+
+if st.session_state.result:
+    st.divider()
+    st.subheader("📄 Final Translation")
+    st.text_area(
+        "Translated Text",
+        value=st.session_state.result,
+        height=300
+    )
     st.download_button(
         "📥 Download Translation",
-        data=st.session_state.translated_text,
+        data=st.session_state.result,
         file_name=f"translation_{st.session_state.thread_id[:8]}.txt",
-        mime="text/plain"
+        mime="text/plain",
+        use_container_width=True
     )
 
 with st.expander("🕘 Translation History"):
     if st.session_state.history:
-        st.dataframe(st.session_state.history, use_container_width=True)
+        st.dataframe(
+            st.session_state.history,
+            use_container_width=True,
+            hide_index=True
+        )
     else:
-        st.info("No completed translations in this session yet.")
-
+        st.info("No translations completed in this session.")
