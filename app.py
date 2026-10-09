@@ -10,6 +10,7 @@ except ImportError:
 
 import io, os, re, json, uuid, time, html, textwrap
 from datetime import datetime
+from threading import Thread
 
 import streamlit as st
 
@@ -17,7 +18,7 @@ st.set_page_config(page_title="AI Translator", page_icon="🌍", layout="wide")
 
 import torch
 import chromadb
-from transformers import AutoTokenizer, AutoModelForSeq2SeqLM
+from transformers import AutoTokenizer, AutoModelForSeq2SeqLM, TextIteratorStreamer
 from pypdf import PdfReader
 from docx import Document
 from reportlab.platypus import SimpleDocTemplate, Paragraph, Spacer, PageBreak
@@ -25,6 +26,9 @@ from reportlab.lib.styles import getSampleStyleSheet, ParagraphStyle
 from reportlab.pdfbase import pdfmetrics
 from reportlab.pdfbase.ttfonts import TTFont
 
+# -----------------------------------------------------------------------------
+# SECRETS & CONFIGURATION
+# -----------------------------------------------------------------------------
 HF_TOKEN = st.secrets.get("HF_TOKEN", None)
 COMPANY_NAME = st.secrets.get("COMPANY_NAME", "AIT GLOBAL")
 MODEL_NAME = st.secrets.get("MODEL_NAME", "facebook/nllb-200-distilled-600M")
@@ -74,7 +78,9 @@ FONTS = {
 DEFAULT_FONTS = ["arial.ttf", "calibri.ttf", "segoeui.ttf"]
 PAGE_RE = re.compile(r"^(=+|-+)\s*(PAGE|PAGINA)\s*\d+.*", re.IGNORECASE)
 
-
+# -----------------------------------------------------------------------------
+# CACHED RESOURCES
+# -----------------------------------------------------------------------------
 @st.cache_resource
 def get_chroma_collection():
     client = chromadb.PersistentClient(path="./chroma_db")
@@ -114,7 +120,9 @@ def get_registered_font(lang):
                 pass
     return "Helvetica"
 
-
+# -----------------------------------------------------------------------------
+# INPUT READING  (returns ("text", str) or ("json", obj))
+# -----------------------------------------------------------------------------
 def read_file(f):
     data, name = f.getvalue(), f.name.lower()
     if name.endswith(".json"):
@@ -141,7 +149,9 @@ def read_prompt(raw):
             pass
     return "text", raw
 
-
+# -----------------------------------------------------------------------------
+# SEGMENTATION / PLANNING
+# -----------------------------------------------------------------------------
 def is_structural_line(line):
     s = line.strip()
     return (not s) or set(s) <= {"-"} or set(s) <= {"="} or set(s) <= {"*"} \
@@ -225,8 +235,11 @@ def plan_json(obj):
     render = lambda tr, strict=False: json.dumps(to_obj(tr), ensure_ascii=False, indent=2)
     return segs, render, to_obj
 
-
+# -----------------------------------------------------------------------------
+# STREAMING ENGINES
+# -----------------------------------------------------------------------------
 def translate_stream(segments, src, tgt, batch_size, tr):
+    """Batch streaming: fast, updates after every batch."""
     pending = [s for s in dict.fromkeys(segments) if s not in tr]
     total = len(pending)
     if not total:
@@ -252,6 +265,43 @@ def translate_stream(segments, src, tgt, batch_size, tr):
             yield done, total
 
 
+def translate_stream_tokens(segments, src, tgt, tr):
+    """Live word-by-word streaming: one sentence at a time."""
+    pending = [s for s in dict.fromkeys(segments) if s not in tr]
+    total = len(pending)
+    if not total:
+        return
+
+    tok, model, device = load_model()
+    tok.src_lang = LANGS[src]
+    bos = tok.convert_tokens_to_ids(LANGS[tgt])
+
+    for i, seg in enumerate(pending, 1):
+        enc = tok(seg, return_tensors="pt", truncation=True, max_length=256).to(device)
+        max_new = min(256, int(enc["input_ids"].shape[1] * 1.6) + 10)
+        streamer = TextIteratorStreamer(tok, skip_prompt=True, skip_special_tokens=True)
+
+        def run():
+            with torch.inference_mode():
+                model.generate(**enc, forced_bos_token_id=bos, num_beams=1,
+                               max_new_tokens=max_new, streamer=streamer)
+
+        t = Thread(target=run)
+        t.start()
+
+        partial = ""
+        for piece in streamer:
+            partial += piece
+            tr[seg] = partial
+            yield i - 0.5, total
+
+        t.join()
+        tr[seg] = partial.strip()
+        yield i, total
+
+# -----------------------------------------------------------------------------
+# PERSISTENCE
+# -----------------------------------------------------------------------------
 def save_to_chroma(thread_id, source, target, original, translated, kind):
     try:
         get_chroma_collection().upsert(
@@ -283,7 +333,9 @@ def fetch_all_chroma_records():
     except Exception:
         return None
 
-
+# -----------------------------------------------------------------------------
+# EXPORTS (cached)
+# -----------------------------------------------------------------------------
 @st.cache_data(show_spinner=False, max_entries=8)
 def make_pdf(text, lang):
     style = ParagraphStyle(
@@ -338,7 +390,9 @@ def make_json(record):
         }
     return json.dumps(payload, ensure_ascii=False, indent=2).encode("utf-8")
 
-
+# -----------------------------------------------------------------------------
+# UI
+# -----------------------------------------------------------------------------
 ss = st.session_state
 ss.setdefault("current_thread_id", None)
 ss.setdefault("current_record", None)
@@ -353,6 +407,7 @@ batch_size = st.select_slider(
     "Batch size (higher = faster, lower = safer on CPU)", [2, 4, 8, 16],
     value=DEFAULT_BATCH_SIZE if DEFAULT_BATCH_SIZE in (2, 4, 8, 16) else 8,
 )
+live_tokens = st.checkbox("Live word-by-word streaming (slower, one sentence at a time)", value=False)
 
 if st.button("🚀 Translate", type="primary"):
     try:
@@ -380,10 +435,16 @@ if st.button("🚀 Translate", type="primary"):
             bar = st.progress(0.0)
             box = st.empty()
             last = 0.0
-            for done, total in translate_stream(segs, source, target, batch_size, tr):
+
+            stream = (
+                translate_stream_tokens(segs, source, target, tr)
+                if live_tokens
+                else translate_stream(segs, source, target, batch_size, tr)
+            )
+            for done, total in stream:
                 bar.progress(min(1.0, done / total))
                 now = time.time()
-                if now - last > 0.25:
+                if now - last > (0.08 if live_tokens else 0.25):
                     last = now
                     box.markdown(
                         f'<div class="stream-box" dir="auto">{html.escape(render(tr, strict=True))}</div>',
@@ -458,4 +519,3 @@ with st.expander("ChromaDB History / Search Thread ID"):
                      f"({meta.get('kind', 'text')})")
     else:
         st.write("No saved translations in database yet.")
-        
