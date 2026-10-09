@@ -1,11 +1,11 @@
-﻿streamlit
+streamlit
 torch
 transformers
 sentencepiece
 ctranslate2
 huggingface_hub
 chromadb
-pysqlite3-binary
+pysqlite3-binary; sys_platform == "linux"
 pypdf
 python-docx
 reportlab

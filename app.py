@@ -89,14 +89,16 @@ def load_backend():
     tok = AutoTokenizer.from_pretrained(MODEL_NAME, token=HF_TOKEN)
 
     try:
-        import ctranslate2
+        ctranslate2 = __import__("ctranslate2")
 
         if not (os.path.isdir(CT2_DIR) and os.listdir(CT2_DIR)):
             if CT2_REPO:
                 from huggingface_hub import snapshot_download
                 snapshot_download(CT2_REPO, local_dir=CT2_DIR, token=HF_TOKEN)
             else:
-                from ctranslate2.converters import TransformersConverter
+                TransformersConverter = __import__(
+                    "ctranslate2.converters", fromlist=["TransformersConverter"]
+                ).TransformersConverter
                 tmp = CT2_DIR + ".tmp"
                 shutil.rmtree(tmp, ignore_errors=True)
                 TransformersConverter(MODEL_NAME, low_cpu_mem_usage=True).convert(
