@@ -408,44 +408,55 @@ with st.expander("ChromaDB History / Search Thread ID"):
         st.write("No saved translations in database yet.")
         import streamlit as st
 
-st.set_page_config(page_title="Amiri Font Viewer", page_icon="🌙", layout="centered")
-
-# Inject Amiri Font & Styling
-st.markdown(
-    """
+# Inject custom CSS for clean UI
+st.markdown("""
     <style>
-    @import url('https://fonts.googleapis.com/css2?family=Amiri:ital,wght@0,400;0,700;1,400&display=swap');
-    
-    * {
-        font-family: 'Amiri', serif !important;
+    /* Main background and font styling */
+    .stApp {
+        background-color: #f8f9fa;
+        font-family: 'Inter', sans-serif;
     }
-    .arabic-display {
-        font-family: 'Amiri', serif;
-        direction: rtl;
-        text-align: right;
-        line-height: 2.0;
-        padding: 24px;
-        background: #f8f9fa;
-        border-radius: 12px;
-        border-right: 5px solid #0d9488;
-        box-shadow: 0 1px 3px rgba(0,0,0,0.1);
+    
+    /* Card-like containers */
+    div[data-testid="stVerticalBlock"] > div {
+        border-radius: 10px;
+    }
+
+    /* Style Primary Buttons */
+    .stButton>button {
+        background-color: #4F46E5;
+        color: white;
+        border-radius: 8px;
+        border: none;
+        padding: 0.5rem 1rem;
+        font-weight: 600;
+        transition: all 0.3s ease;
+    }
+    .stButton>button:hover {
+        background-color: #4338CA;
+        color: white;
+    }
+
+    /* Custom Header Style */
+    .main-header {
+        color: #1E293B;
+        text-align: center;
+        padding: 1rem 0;
+        font-weight: 700;
     }
     </style>
-    """,
-    unsafe_allow_html=True
-)
+""", unsafe_allow_html=True)
 
-st.title("🌙 Amiri Typography Viewer")
+# Application UI Elements
+st.markdown("<h1 class='main-header'>🌐 Global AI Translator</h1>", unsafe_allow_html=True)
+st.write("Translate text and export high-quality PDFs seamlessly.")
 
-font_size = st.sidebar.slider("Font Size (px)", min_value=18, max_value=60, value=32)
-
-arabic_text = st.text_area(
-    "Arabic Text Input:",
-    value="بِسْمِ اللهِ الرَّحْمٰنِ الرَّحِيمِ\nالْحَمْدُ لِلَّهِ رَبِّ الْعَالَمِينَ",
-    height=120
-)
-
-st.markdown(
-    f'<div class="arabic-display" style="font-size: {font_size}px;">{arabic_text}</div>',
-    unsafe_allow_html=True
-)
+# Example layout container
+with st.container():
+    user_input = st.text_area("Source Text", placeholder="Type or paste text here...", height=150)
+    
+    col1, col2 = st.columns([1, 1])
+    with col1:
+        st.button("Translate Text")
+    with col2:
+        st.button("Download PDF")
