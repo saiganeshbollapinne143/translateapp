@@ -1,7 +1,11 @@
 ﻿streamlit
 torch
 transformers
+sentencepiece
+ctranslate2
+huggingface_hub
 chromadb
+pysqlite3-binary
 pypdf
 python-docx
 reportlab
