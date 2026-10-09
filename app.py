@@ -406,3 +406,46 @@ with st.expander("ChromaDB History / Search Thread ID"):
             st.write(f"`{tid}` — {meta.get('timestamp', 'N/A')} — {meta.get('source_lang', '')} → {meta.get('target_lang', '')}")
     else:
         st.write("No saved translations in database yet.")
+        import streamlit as st
+
+st.set_page_config(page_title="Amiri Font Viewer", page_icon="🌙", layout="centered")
+
+# Inject Amiri Font & Styling
+st.markdown(
+    """
+    <style>
+    @import url('https://fonts.googleapis.com/css2?family=Amiri:ital,wght@0,400;0,700;1,400&display=swap');
+    
+    * {
+        font-family: 'Amiri', serif !important;
+    }
+    .arabic-display {
+        font-family: 'Amiri', serif;
+        direction: rtl;
+        text-align: right;
+        line-height: 2.0;
+        padding: 24px;
+        background: #f8f9fa;
+        border-radius: 12px;
+        border-right: 5px solid #0d9488;
+        box-shadow: 0 1px 3px rgba(0,0,0,0.1);
+    }
+    </style>
+    """,
+    unsafe_allow_html=True
+)
+
+st.title("🌙 Amiri Typography Viewer")
+
+font_size = st.sidebar.slider("Font Size (px)", min_value=18, max_value=60, value=32)
+
+arabic_text = st.text_area(
+    "Arabic Text Input:",
+    value="بِسْمِ اللهِ الرَّحْمٰنِ الرَّحِيمِ\nالْحَمْدُ لِلَّهِ رَبِّ الْعَالَمِينَ",
+    height=120
+)
+
+st.markdown(
+    f'<div class="arabic-display" style="font-size: {font_size}px;">{arabic_text}</div>',
+    unsafe_allow_html=True
+)
