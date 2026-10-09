@@ -8,7 +8,7 @@ from reportlab.lib.styles import getSampleStyleSheet
 from reportlab.lib.pagesizes import A4
 
 st.set_page_config(page_title="AI Translator", layout="wide")
-st.title("🌍 NLLB-200 Document Translator")
+st.title("🌍 AIT GLOBAL Document Translator")
 
 MODEL = "facebook/nllb-200-distilled-600M"
 MAX_NEW_TOKENS = 800
