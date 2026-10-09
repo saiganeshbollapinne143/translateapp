@@ -1,8 +1,10 @@
 ﻿streamlit
 torch
 transformers
+chromadb
+pysqlite3-binary
 pypdf
 python-docx
 reportlab
-sentencepiece
-sacremoses
+arabic-reshaper
+python-bidi
