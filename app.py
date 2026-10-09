@@ -1,5 +1,4 @@
-
-import io, os, re, json, uuid
+import io, os, re, uuid, textwrap
 from datetime import datetime
 import streamlit as st
 import torch
@@ -7,131 +6,182 @@ from transformers import AutoTokenizer, AutoModelForSeq2SeqLM
 from pypdf import PdfReader
 from docx import Document
 from reportlab.platypus import SimpleDocTemplate, Paragraph, Spacer
-from reportlab.lib.styles import getSampleStyleSheet
-from reportlab.lib.pagesizes import A4
+from reportlab.lib.styles import getSampleStyleSheet, ParagraphStyle
+from reportlab.pdfbase import pdfmetrics
+from reportlab.pdfbase.ttfonts import TTFont
 
-st.set_page_config(page_title="AIT Global Technologies Translator", layout="centered")
-st.title("AIT GLOBAL TECHNOLOGIES — TRANSLATOR")
+st.set_page_config(page_title="AI Translator", page_icon="🌍", layout="wide")
+st.markdown("""
+<style>
+.block-container {padding-top: 2rem; max-width: 1100px;}
+h1 {background: linear-gradient(90deg,#2563eb,#7c3aed); -webkit-background-clip: text;
+    -webkit-text-fill-color: transparent; font-weight: 800;}
+.stButton>button {border-radius: 10px; font-weight: 600;}
+</style>
+""", unsafe_allow_html=True)
+st.title("🌍 AIT GLOBAL TECHNOLOGIES - TRANSLATOR")
 
-LANG = {"English":"eng_Latn","Tamil":"tam_Taml","Hindi":"hin_Deva","Telugu":"tel_Telu","Kannada":"kan_Knda","Malayalam":"mal_Mlym","French":"fra_Latn","Spanish":"spa_Latn","German":"deu_Latn","Chinese":"zho_Hans","Japanese":"jpn_Jpan","Arabic":"arb_Arab","Portuguese":"por_Latn","Russian":"rus_Cyrl","Bengali":"ben_Beng"}
+LANGS = {
+    "English": "eng_Latn", "Tamil": "tam_Taml", "Hindi": "hin_Deva", "Telugu": "tel_Telu",
+    "French": "fra_Latn", "Spanish": "spa_Latn", "German": "deu_Latn", "Chinese": "zho_Hans",
+    "Arabic": "arb_Arab", "Japanese": "jpn_Jpan", "Korean": "kor_Hang",
+    "Portuguese": "por_Latn", "Russian": "rus_Cyrl", "Italian": "ita_Latn",
+}
+
+# Windows font candidates per language (for PDF output); falls back to Helvetica
+WIN = os.path.join(os.environ.get("WINDIR", r"C:\Windows"), "Fonts")
+FONTS = {
+    "Tamil": ["Nirmala.ttf"], "Hindi": ["Nirmala.ttf"], "Telugu": ["Nirmala.ttf"],
+    "Chinese": ["msyh.ttc", "simsun.ttc"], "Japanese": ["YuGothR.ttc", "msgothic.ttc"],
+    "Korean": ["malgun.ttf"], "Arabic": ["arial.ttf", "tahoma.ttf"],
+}
+DEFAULT_FONTS = ["arial.ttf", "calibri.ttf", "segoeui.ttf"]
+
 
 @st.cache_resource
 def load_model():
     name = "facebook/nllb-200-distilled-600M"
-    token = os.getenv("HF_TOKEN") or st.secrets.get("HF_TOKEN", "")
-    tok = AutoTokenizer.from_pretrained(name, token=token or None)
-    model = AutoModelForSeq2SeqLM.from_pretrained(name, token=token or None)
-    return tok, model
+    tok = AutoTokenizer.from_pretrained(name)
+    model = AutoModelForSeq2SeqLM.from_pretrained(name).eval()
+    if torch.cuda.is_available():
+        device = "cuda"
+        model = model.half().to(device)
+    else:
+        device = "cpu"
+        torch.set_num_threads(os.cpu_count() or 4)
+        model = torch.quantization.quantize_dynamic(model, {torch.nn.Linear}, dtype=torch.qint8)
+    return tok, model, device
 
-def extract(f):
-    n = f.name.lower()
-    if n.endswith(".txt"): return f.getvalue().decode("utf-8", errors="replace")
-    if n.endswith(".pdf"): return "\n".join(p.extract_text() or "" for p in PdfReader(f).pages)
-    if n.endswith(".docx"): return "\n".join(p.text for p in Document(f).paragraphs)
-    if n.endswith(".json"): return json.dumps(json.load(f), ensure_ascii=False, indent=2)
-    raise ValueError("Unsupported file format.")
 
-def translate(text, src, dst, prompt, tok, model, bar):
-    tok.src_lang = LANG[src]
-    chunks = [x.strip() for x in re.split(r"\n+", text) if x.strip()]
-    result = []
-    if not chunks: return ""
-    for i, chunk in enumerate(chunks):
-        words = chunk.split()
-        for j in range(0, len(words), 180):
-            part = " ".join(words[j:j+180])
-            instruction = (prompt.strip() + "\n\n") if prompt.strip() else ""
-            inputs = tok(instruction + part, return_tensors="pt", truncation=True, max_length=512)
-            with torch.no_grad():
-                ids = model.generate(**inputs, forced_bos_token_id=tok.convert_tokens_to_ids(LANG[dst]), max_new_tokens=256)
-            result.append(tok.batch_decode(ids, skip_special_tokens=True)[0])
-        bar.progress((i+1)/len(chunks), text=f"Translating section {i+1}/{len(chunks)}")
-    return "\n".join(result)
+def read_file(file):
+    data, n = file.getvalue(), file.name.lower()
+    if n.endswith(".txt"):
+        return data.decode("utf-8-sig", errors="replace")
+    if n.endswith(".pdf"):
+        return "\n".join(p.extract_text() or "" for p in PdfReader(io.BytesIO(data)).pages)
+    return "\n".join(p.text for p in Document(io.BytesIO(data)).paragraphs)
+
+
+def split_sentences(line, max_chars=400):
+    out = []
+    for s in re.split(r"(?<=[.!?।。！？؟])\s*", line):
+        s = s.strip()
+        if s:
+            out += textwrap.wrap(s, max_chars, break_long_words=False) if len(s) > max_chars else [s]
+    return out
+
+
+def translate(text, src, tgt, batch_size, progress):
+    tok, model, device = load_model()
+    tok.src_lang = LANGS[src]
+    bos = tok.convert_tokens_to_ids(LANGS[tgt])
+    lines = text.splitlines()
+    units = [(li, s) for li, ln in enumerate(lines) if ln.strip() for s in split_sentences(ln)]
+    order = sorted(range(len(units)), key=lambda i: len(units[i][1]))  # length-sort = less padding
+    outs = [""] * len(units)
+    for start in range(0, len(order), batch_size):
+        idx = order[start:start + batch_size]
+        enc = tok([units[i][1] for i in idx], return_tensors="pt", padding=True,
+                  truncation=True, max_length=256).to(device)
+        with torch.inference_mode():
+            ids = model.generate(**enc, forced_bos_token_id=bos, num_beams=1,
+                                 max_new_tokens=int(enc["input_ids"].shape[1] * 1.6) + 10)
+        for i, t in zip(idx, tok.batch_decode(ids, skip_special_tokens=True)):
+            outs[i] = t
+        progress.progress(min(1.0, (start + batch_size) / max(1, len(order))))
+    rebuilt = {}
+    for (li, _), t in zip(units, outs):
+        rebuilt.setdefault(li, []).append(t)
+    return "\n".join(" ".join(rebuilt[i]) if i in rebuilt else "" for i in range(len(lines)))
+
+
+def make_pdf(text, lang):
+    font = "Helvetica"
+    for f in FONTS.get(lang, []) + DEFAULT_FONTS:
+        path = os.path.join(WIN, f)
+        if os.path.exists(path):
+            try:
+                pdfmetrics.registerFont(TTFont("UF", path))
+                font = "UF"
+                break
+            except Exception:
+                pass
+    style = ParagraphStyle("u", parent=getSampleStyleSheet()["Normal"], fontName=font, fontSize=11, leading=16)
+    rtl = lang == "Arabic"
+    if rtl:
+        try:
+            import arabic_reshaper
+            from bidi.algorithm import get_display
+        except ImportError:
+            rtl = False
+    out = io.BytesIO()
+    story = []
+    for line in text.splitlines():
+        if rtl and line.strip():
+            line = get_display(arabic_reshaper.reshape(line))
+        safe = line.replace("&", "&amp;").replace("<", "&lt;").replace(">", "&gt;") or " "
+        story += [Paragraph(safe, style), Spacer(1, 4)]
+    SimpleDocTemplate(out).build(story)
+    return out.getvalue()
+
 
 def make_docx(text):
-    b = io.BytesIO()
-    d = Document()
-    for line in text.splitlines(): d.add_paragraph(line)
-    d.save(b)
-    return b.getvalue()
+    out, doc = io.BytesIO(), Document()
+    for line in text.splitlines():
+        doc.add_paragraph(line)
+    doc.save(out)
+    return out.getvalue()
 
-def make_pdf(text):
-    b = io.BytesIO()
-    doc = SimpleDocTemplate(b, pagesize=A4)
-    styles = getSampleStyleSheet()
-    story = [Paragraph(line.replace("&","&amp;").replace("<","&lt;").replace(">","&gt;") or " ", styles["Normal"]) for line in text.splitlines()]
-    doc.build(story)
-    return b.getvalue()
 
-# Persistent history file: works on persistent local storage.
-# For Streamlit Cloud, use a database if history must survive app restarts.
-HISTORY_FILE = "translation_history.json"
+# ---------------- UI ----------------
+ss = st.session_state
+ss.setdefault("history", {})   # thread_id -> record
+ss.setdefault("current", None)
 
-def load_history():
-    try:
-        with open(HISTORY_FILE, "r", encoding="utf-8") as f: return json.load(f)
-    except (OSError, json.JSONDecodeError): return []
-
-def save_history(history):
-    with open(HISTORY_FILE, "w", encoding="utf-8") as f:
-        json.dump(history, f, ensure_ascii=False, indent=2)
-
-if "thread_id" not in st.session_state: st.session_state.thread_id = str(uuid.uuid4())[:8]
-if "history" not in st.session_state: st.session_state.history = load_history()
-
-st.subheader("Translation Settings")
-thread_id = st.text_input("Thread ID", value=st.session_state.thread_id)
-prompt = st.text_area("Prompt Template", value="Translate accurately into the target language. Preserve meaning, headings, names, numbers, and formatting.")
-uploaded = st.file_uploader("Upload source file", type=["pdf", "txt", "docx", "json"])
 c1, c2 = st.columns(2)
-src = c1.selectbox("Source language", list(LANG))
-dst = c2.selectbox("Target language", list(LANG), index=1)
+source = c1.selectbox("Input language", list(LANGS), index=0)
+target = c2.selectbox("Translate into", list(LANGS), index=1)
+uploaded = st.file_uploader("Upload PDF, TXT, or DOCX", type=["pdf", "txt", "docx"])
+prompt = st.text_area("Or enter text to translate", height=150)
+batch_size = st.select_slider("Batch size (higher = faster, more RAM)", [4, 8, 16, 32], value=8)
 
-if st.button("Translate Document", use_container_width=True):
-    if not uploaded: st.warning("Please upload a file.")
-    elif src == dst: st.warning("Choose different source and target languages.")
-    elif not thread_id.strip(): st.warning("Enter a thread ID.")
+if st.button("🚀 Translate", type="primary"):
+    text = read_file(uploaded) if uploaded else prompt
+    if not text.strip():
+        st.error("Upload a file or enter text first.")
+    elif source == target:
+        st.warning("Choose different input and output languages.")
     else:
         try:
-            source_text = extract(uploaded)
-            if not source_text.strip(): st.error("No readable text found.")
-            else:
-                with st.spinner("Loading translation model..."): tok, model = load_model()
-                bar = st.progress(0, text="Starting translation...")
-                result = translate(source_text, src, dst, prompt, tok, model, bar)
-                if result:
-                    record = {"thread_id":thread_id.strip(), "timestamp":datetime.now().isoformat(timespec="seconds"), "filename":uploaded.name, "source_language":src, "target_language":dst, "prompt":prompt, "source_text":source_text, "translation":result}
-                    history = load_history()
-                    history.append(record)
-                    save_history(history)
-                    st.session_state.history = history
-                    st.session_state.translated = result
-                    st.session_state.current_thread = thread_id.strip()
-                    st.success("Translation completed and history saved.")
-                else: st.warning("No text found to translate.")
-        except Exception as e: st.error(f"Translation failed: {e}")
+            with st.spinner("Loading NLLB-200 model (first run may take time)..."):
+                load_model()
+            bar = st.progress(0)
+            result = translate(text, source, target, batch_size, bar)
+            bar.empty()
+            tid = str(uuid.uuid4())
+            ss.history[tid] = {"time": datetime.now().strftime("%Y-%m-%d %H:%M:%S"),
+                               "source": source, "target": target, "original": text, "translated": result}
+            ss.current = tid
+        except Exception as e:
+            st.error(f"Translation failed: {e}")
 
-if st.session_state.get("translated"):
-    result = st.session_state.translated
-    st.subheader("Translated Output")
-    st.text_area("Result", result, height=220)
-    st.download_button("Download TXT", result, "translation.txt", "text/plain")
-    st.download_button("Download PDF", make_pdf(result), "translation.pdf", "application/pdf")
-    st.download_button("Download DOCX", make_docx(result), "translation.docx", "application/vnd.openxmlformats-officedocument.wordprocessingml.document")
-    st.download_button("Download JSON", json.dumps({"thread_id":st.session_state.get("current_thread",""),"translation":result}, ensure_ascii=False, indent=2), "translation.json", "application/json")
+# Output lives outside the button block so downloads don't wipe it
+if ss.current:
+    rec = ss.history[ss.current]
+    st.success(f"Translation completed! Thread ID: {ss.current}")
+    st.text_area("Final translation", rec["translated"], height=300)
+    d1, d2, d3 = st.columns(3)
+    d1.download_button("⬇️ PDF", make_pdf(rec["translated"], rec["target"]), "translation.pdf", "application/pdf")
+    d2.download_button("⬇️ DOCX", make_docx(rec["translated"]), "translation.docx",
+                       "application/vnd.openxmlformats-officedocument.wordprocessingml.document")
+    d3.download_button("⬇️ TXT", rec["translated"], "translation.txt", "text/plain")
 
-st.subheader("Translation History")
-history = load_history()
-st.session_state.history = history
-if history:
-    ids = list(dict.fromkeys(r.get("thread_id", "") for r in history))
-    selected = st.selectbox("Filter by Thread ID", ["All"] + ids)
-    shown = history if selected == "All" else [r for r in history if r.get("thread_id") == selected]
-    for i, record in enumerate(reversed(shown)):
-        with st.expander(f'{record.get("timestamp","")} | {record.get("filename","")} | Thread: {record.get("thread_id","")}'):
-            st.write("Languages:", record.get("source_language"), "→", record.get("target_language"))
-            st.write("Prompt:", record.get("prompt", ""))
-            st.text_area("Saved translation", record.get("translation", ""), height=150, key=f"hist_{i}_{record.get('thread_id','')}")
-    st.download_button("Download History JSON", json.dumps(history, ensure_ascii=False, indent=2), "translation_history.json", "application/json")
-else:
-    st.info("No saved translation history yet.")
+with st.expander("Translation history / import by thread ID"):
+    tid_in = st.text_input("Thread ID")
+    if st.button("Load thread") and tid_in.strip() in ss.history:
+        ss.current = tid_in.strip()
+        st.rerun()
+    for t, r in reversed(list(ss.history.items())):
+        st.write(f"`{t}` — {r['time']} — {r['source']} → {r['target']}")
+    if not ss.history:
+        st.write("No translations yet.")
