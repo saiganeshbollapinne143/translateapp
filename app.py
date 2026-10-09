@@ -28,7 +28,7 @@ HF_TOKEN = st.secrets.get("HF_TOKEN", None)
 COMPANY_NAME = st.secrets.get("COMPANY_NAME", "AIT GLOBAL")
 APP_TITLE = st.secrets.get("APP_TITLE", "AIT GLOBAL TECHNOLOGIES - TRANSLATOR")
 MODEL_NAME = st.secrets.get("MODEL_NAME", "facebook/nllb-200-distilled-600M")
-DEFAULT_BATCH_SIZE = int(st.secrets.get("DEFAULT_BATCH_SIZE", 16))
+DEFAULT_BATCH_SIZE = int(st.secrets.get("DEFAULT_BATCH_SIZE", 8))
 
 st.set_page_config(page_title="AI Translator", page_icon="🌍", layout="wide")
 
@@ -108,13 +108,13 @@ DEFAULT_FONTS = ["arial.ttf", "calibri.ttf", "segoeui.ttf"]
 # -----------------------------------------------------------------------------
 @st.cache_resource
 def get_chroma_collection():
-    """Initializes local ChromaDB client and persistent collection."""
+    """Initializes ChromaDB persistent client safely."""
     client = chromadb.PersistentClient(path="./chroma_db")
     return client.get_or_create_collection(name="translation_history")
 
 @st.cache_resource
 def load_model():
-    """Loads tokenizer and Seq2Seq model into GPU/CPU memory with optimization."""
+    """Loads tokenizer and Seq2Seq model with safe memory limits for CPU hosting."""
     tok = AutoTokenizer.from_pretrained(MODEL_NAME, token=HF_TOKEN)
     model = AutoModelForSeq2SeqLM.from_pretrained(
         MODEL_NAME, token=HF_TOKEN, low_cpu_mem_usage=True
@@ -123,14 +123,9 @@ def load_model():
     if torch.cuda.is_available():
         device = "cuda"
         model = model.to(device=device, dtype=torch.float16)
-        if hasattr(torch, "compile"):
-            try:
-                model = torch.compile(model)
-            except Exception:
-                pass
     else:
         device = "cpu"
-        torch.set_num_threads(os.cpu_count() or 4)
+        torch.set_num_threads(2)
         
     return tok, model, device
 
@@ -138,7 +133,7 @@ def load_model():
 # HELPER FUNCTIONS
 # -----------------------------------------------------------------------------
 def read_file(f):
-    """Extracts raw text while preserving structural layout and dividers."""
+    """Extracts raw text while preserving structural layout and page dividers."""
     data, n = f.getvalue(), f.name.lower()
     if n.endswith(".txt"):
         return data.decode("utf-8-sig", errors="replace")
@@ -154,14 +149,14 @@ def read_file(f):
     return "\n".join(p.text for p in doc.paragraphs)
 
 def is_structural_line(line):
-    """Detects page markers, separators, or structural numbers to bypass translation."""
+    """Detects page markers, separators, or numbers to leave untranslated."""
     s = line.strip()
     if not s or set(s) in [{'-'}, {'='}, {'*'}] or re.match(r"^(=+|-+)\s*(PAGE|PAGINA)\s*\d+.*", s, re.IGNORECASE) or re.match(r"^\d+[\.\)]?$", s):
         return True
     return False
 
-def split_sentences(line, max_chars=512):
-    """Splits long lines into context-sized sentence chunks."""
+def split_sentences(line, max_chars=400):
+    """Splits text into chunks optimized for model context."""
     out = []
     for s in re.split(r"(?<=[.!?।。！？؟])\s*", line):
         s = s.strip()
@@ -170,7 +165,7 @@ def split_sentences(line, max_chars=512):
     return out
 
 def translate_stream(text, src, tgt, batch_size, progress_bar):
-    """Batches non-structural text for parallelized token processing."""
+    """Translates text in memory-safe batches while updating the progress bar."""
     tok, model, device = load_model()
     tok.src_lang = LANGS[src]
     
@@ -209,7 +204,7 @@ def translate_stream(text, src, tgt, batch_size, progress_bar):
                 return_tensors="pt",
                 padding=True,
                 truncation=True,
-                max_length=512,
+                max_length=256,
             ).to(device)
 
             with torch.inference_mode():
@@ -217,7 +212,7 @@ def translate_stream(text, src, tgt, batch_size, progress_bar):
                     **enc,
                     forced_bos_token_id=bos,
                     num_beams=1,
-                    max_new_tokens=512,
+                    max_new_tokens=256,
                 )
 
             decoded = tok.batch_decode(ids, skip_special_tokens=True)
@@ -237,30 +232,39 @@ def translate_stream(text, src, tgt, batch_size, progress_bar):
 # PERSISTENCE & EXPORT FUNCTIONS
 # -----------------------------------------------------------------------------
 def save_to_chroma(thread_id, source, target, original, translated):
-    """Saves completed translation to persistent ChromaDB collection."""
-    collection = get_chroma_collection()
-    collection.add(
-        documents=[translated],
-        metadatas=[{
-            "timestamp": datetime.now().strftime("%Y-%m-%d %H:%M:%S"),
-            "source_lang": source,
-            "target_lang": target,
-            "original_text": original[:1000]
-        }],
-        ids=[thread_id]
-    )
+    """Saves record details into ChromaDB."""
+    try:
+        collection = get_chroma_collection()
+        collection.add(
+            documents=[translated],
+            metadatas=[{
+                "timestamp": datetime.now().strftime("%Y-%m-%d %H:%M:%S"),
+                "source_lang": source,
+                "target_lang": target,
+                "original_text": original[:1000]
+            }],
+            ids=[thread_id]
+        )
+    except Exception as e:
+        st.warning(f"Could not persist record to ChromaDB: {e}")
 
 def fetch_from_chroma(thread_id):
-    """Fetches document metadata and text from ChromaDB using System Thread ID."""
-    collection = get_chroma_collection()
-    res = collection.get(ids=[thread_id])
-    if res and res["ids"]:
-        return {"translated": res["documents"][0], "metadata": res["metadatas"][0]}
+    """Fetches details from ChromaDB by System Thread ID."""
+    try:
+        collection = get_chroma_collection()
+        res = collection.get(ids=[thread_id])
+        if res and res["ids"]:
+            return {"translated": res["documents"][0], "metadata": res["metadatas"][0]}
+    except Exception:
+        pass
     return None
 
 def fetch_all_chroma_records():
-    """Retrieves all historical translation records."""
-    return get_chroma_collection().get()
+    """Retrieves stored records from ChromaDB."""
+    try:
+        return get_chroma_collection().get()
+    except Exception:
+        return None
 
 def get_registered_font(lang):
     candidate_fonts = [
@@ -325,7 +329,7 @@ def make_docx(text):
     return out.getvalue()
 
 # -----------------------------------------------------------------------------
-# STREAMLIT UI & EVENT HANDLERS
+# INTERFACE & INTERACTION
 # -----------------------------------------------------------------------------
 ss = st.session_state
 ss.setdefault("current_thread_id", None)
@@ -336,7 +340,7 @@ source = c1.selectbox("Input language", list(LANGS), index=0)
 target = c2.selectbox("Translate into", list(LANGS), index=1)
 uploaded = st.file_uploader("Upload PDF, TXT, or DOCX", type=["pdf", "txt", "docx"])
 prompt = st.text_area("Or enter text to translate", height=120)
-batch_size = st.select_slider("Batch size (higher = faster processing)", [4, 8, 16, 32, 64], value=DEFAULT_BATCH_SIZE)
+batch_size = st.select_slider("Batch size (higher = faster, lower = safer on CPU)", [2, 4, 8, 16], value=DEFAULT_BATCH_SIZE)
 
 if st.button("🚀 Translate", type="primary"):
     text = read_file(uploaded) if uploaded else prompt
@@ -346,7 +350,7 @@ if st.button("🚀 Translate", type="primary"):
         st.warning("Choose different input and output languages.")
     else:
         try:
-            with st.spinner("Initializing translation engine..."):
+            with st.spinner("Loading NLLB-200 translation model..."):
                 load_model()
 
             bar = st.progress(0)
@@ -362,7 +366,6 @@ if st.button("🚀 Translate", type="primary"):
 
             bar.empty()
             
-            # Automatically assign System Thread ID and record in ChromaDB
             auto_thread_id = f"TR-{uuid.uuid4().hex[:10].upper()}"
             save_to_chroma(auto_thread_id, source, target, text, final_text)
             
@@ -373,7 +376,7 @@ if st.button("🚀 Translate", type="primary"):
             st.error(f"Translation failed: {e}")
 
 if ss.current_thread_id and ss.current_record:
-    st.success(f"Translation saved to ChromaDB! System Thread ID: `{ss.current_thread_id}`")
+    st.success(f"Translation saved! System Thread ID: `{ss.current_thread_id}`")
     st.text_area("Final translation", ss.current_record["translated"], height=300)
 
     d1, d2, d3 = st.columns(3)
@@ -381,7 +384,7 @@ if ss.current_thread_id and ss.current_record:
     d2.download_button("⬇️ DOCX", make_docx(ss.current_record["translated"]), "translation.docx", "application/vnd.openxmlformats-officedocument.wordprocessingml.document")
     d3.download_button("⬇️ TXT", ss.current_record["translated"], "translation.txt", "text/plain")
 
-with st.expander("ChromaDB History / Import by System Thread ID"):
+with st.expander("ChromaDB History / Search Thread ID"):
     tid_in = st.text_input("System Thread ID")
     if st.button("Load thread"):
         if tid_in.strip():
@@ -394,12 +397,12 @@ with st.expander("ChromaDB History / Import by System Thread ID"):
                 }
                 st.rerun()
             else:
-                st.warning("Thread ID not found in ChromaDB database.")
+                st.warning("Thread ID not found in database.")
                 
     st.subheader("Saved Records")
     records = fetch_all_chroma_records()
-    if records and records["ids"]:
+    if records and records.get("ids"):
         for tid, meta in zip(records["ids"], records["metadatas"]):
             st.write(f"`{tid}` — {meta.get('timestamp', 'N/A')} — {meta.get('source_lang', '')} → {meta.get('target_lang', '')}")
     else:
-        st.write("No saved translations found in ChromaDB.")
+        st.write("No saved translations in database yet.")
