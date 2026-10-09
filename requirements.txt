@@ -1,8 +1,13 @@
-﻿streamlit
+﻿
+streamlit
 torch
-torchvision
 transformers
 sentencepiece
-chromadb
+protobuf
 pypdf
 python-docx
+openpyxl
+pandas
+python-pptx
+reportlab
+
