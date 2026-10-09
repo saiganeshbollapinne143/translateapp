@@ -1,3 +1,9 @@
+# =============================================================================
+# Optional secrets (Streamlit Cloud -> Settings -> Secrets):
+# HF_TOKEN, COMPANY_NAME, MODEL_NAME, CT2_REPO (pre-converted CTranslate2 repo),
+# ALLOW_CT2_CONVERT (true/false), TORCH_THREADS, DEFAULT_BATCH_SIZE
+# =============================================================================
+
 # -----------------------------------------------------------------------------
 # SQLITE PATCH FOR CHROMADB COMPATIBILITY (MUST BE AT VERY TOP)
 # -----------------------------------------------------------------------------
@@ -15,7 +21,12 @@ import streamlit as st
 
 st.set_page_config(page_title="AI Translator", page_icon="🌍", layout="wide")
 
-import chromadb
+# Chroma is optional: if it fails to import, the app still translates.
+try:
+    import chromadb
+except Exception:
+    chromadb = None
+
 from transformers import AutoTokenizer
 from pypdf import PdfReader
 from docx import Document
@@ -24,16 +35,30 @@ from reportlab.lib.styles import getSampleStyleSheet, ParagraphStyle
 from reportlab.pdfbase import pdfmetrics
 from reportlab.pdfbase.ttfonts import TTFont
 
+
 # -----------------------------------------------------------------------------
-# SECRETS & CONFIGURATION
+# SECRETS & CONFIGURATION (safe even when no secrets are configured)
 # -----------------------------------------------------------------------------
-HF_TOKEN = st.secrets.get("HF_TOKEN", None)
-COMPANY_NAME = st.secrets.get("COMPANY_NAME", "AIT GLOBAL")
-MODEL_NAME = st.secrets.get("MODEL_NAME", "facebook/nllb-200-distilled-600M")
-CT2_REPO = st.secrets.get("CT2_REPO", "")  # optional: pre-converted CTranslate2 repo on HF
+def secret(key, default=None):
+    try:
+        return st.secrets.get(key, default)
+    except Exception:
+        return default
+
+
+def as_bool(v):
+    return str(v).strip().lower() in ("1", "true", "yes", "on")
+
+
+HF_TOKEN = secret("HF_TOKEN", None)
+COMPANY_NAME = secret("COMPANY_NAME", "AIT GLOBAL")
+MODEL_NAME = secret("MODEL_NAME", "facebook/nllb-200-distilled-600M")
+CT2_REPO = secret("CT2_REPO", "")  # optional: pre-converted CTranslate2 repo on HF
 CT2_DIR = os.path.join(os.getcwd(), "ct2_nllb_int8")
-THREADS = int(st.secrets.get("TORCH_THREADS", os.cpu_count() or 2))
-DEFAULT_BATCH_SIZE = int(st.secrets.get("DEFAULT_BATCH_SIZE", 16))
+# On-the-fly conversion needs ~2.5 GB RAM: allowed locally on Windows, off on Cloud by default.
+ALLOW_CT2_CONVERT = as_bool(secret("ALLOW_CT2_CONVERT", os.name == "nt"))
+THREADS = int(secret("TORCH_THREADS", os.cpu_count() or 2))
+DEFAULT_BATCH_SIZE = int(secret("DEFAULT_BATCH_SIZE", 16))
 TM_LIMIT = 20000
 CHROMA_COLLECTION = "translation_history_fast"
 CHROMA_LEGACY = "translation_history"
@@ -57,7 +82,7 @@ st.markdown(
 }}
 </style>
 <div class="banner">
-    <span style="color:#FFD700">{html.escape(COMPANY_NAME)}</span>
+    <span style="color:#FFD700">{html.escape(str(COMPANY_NAME))}</span>
     <span style="color:#FFFFFF"> TECHNOLOGIES - TRANSLATOR</span>
 </div>
 """,
@@ -95,7 +120,7 @@ def load_backend():
             if CT2_REPO:
                 from huggingface_hub import snapshot_download
                 snapshot_download(CT2_REPO, local_dir=CT2_DIR, token=HF_TOKEN)
-            else:
+            elif ALLOW_CT2_CONVERT:
                 TransformersConverter = __import__(
                     "ctranslate2.converters", fromlist=["TransformersConverter"]
                 ).TransformersConverter
@@ -105,6 +130,9 @@ def load_backend():
                     tmp, quantization="int8", force=True
                 )
                 os.replace(tmp, CT2_DIR)
+            else:
+                # Not enough RAM to convert here -> silently use the PyTorch fallback.
+                raise RuntimeError("No CT2_REPO and conversion disabled")
 
         cuda = ctranslate2.get_cuda_device_count() > 0
         translator = ctranslate2.Translator(
@@ -121,9 +149,13 @@ def load_backend():
     import torch
     from transformers import AutoModelForSeq2SeqLM
 
-    model = AutoModelForSeq2SeqLM.from_pretrained(
-        MODEL_NAME, token=HF_TOKEN, low_cpu_mem_usage=True
-    ).eval()
+    try:
+        model = AutoModelForSeq2SeqLM.from_pretrained(
+            MODEL_NAME, token=HF_TOKEN, low_cpu_mem_usage=True
+        ).eval()
+    except ImportError:  # accelerate missing
+        model = AutoModelForSeq2SeqLM.from_pretrained(MODEL_NAME, token=HF_TOKEN).eval()
+
     if torch.cuda.is_available():
         device = "cuda"
         model = model.to(device=device, dtype=torch.float16)
@@ -189,20 +221,30 @@ def translate_stream(segments, src, tgt, chunk_size, beam, tr):
 
 
 # -----------------------------------------------------------------------------
-# CHROMADB (lightweight hashed embeddings, no embedding model download)
+# CHROMADB (optional; lightweight hashed embeddings, no embedding model download)
 # -----------------------------------------------------------------------------
 @st.cache_resource
 def get_chroma_client():
-    return chromadb.PersistentClient(path="./chroma_db")
+    if chromadb is None:
+        return None
+    try:
+        return chromadb.PersistentClient(path="./chroma_db")
+    except Exception:
+        return None
 
 
 @st.cache_resource
 def get_chroma_collection():
     client = get_chroma_client()
+    if client is None:
+        return None
     try:
         return client.get_or_create_collection(name=CHROMA_COLLECTION, embedding_function=None)
     except Exception:
-        return client.get_or_create_collection(name=CHROMA_COLLECTION)
+        try:
+            return client.get_or_create_collection(name=CHROMA_COLLECTION)
+        except Exception:
+            return None
 
 
 def embed(text, dim=128):
@@ -214,8 +256,12 @@ def embed(text, dim=128):
 
 
 def save_to_chroma(thread_id, source, target, original, translated, kind):
+    coll = get_chroma_collection()
+    if coll is None:
+        st.info("ChromaDB is unavailable, so this translation was not saved to history.")
+        return
     try:
-        get_chroma_collection().upsert(
+        coll.upsert(
             ids=[thread_id],
             documents=[translated],
             embeddings=[embed(translated)],
@@ -233,11 +279,15 @@ def save_to_chroma(thread_id, source, target, original, translated, kind):
 
 def fetch_from_chroma(thread_id):
     colls = [get_chroma_collection()]
-    try:
-        colls.append(get_chroma_client().get_collection(CHROMA_LEGACY))
-    except Exception:
-        pass
+    client = get_chroma_client()
+    if client is not None:
+        try:
+            colls.append(client.get_collection(CHROMA_LEGACY))
+        except Exception:
+            pass
     for c in colls:
+        if c is None:
+            continue
         try:
             res = c.get(ids=[thread_id])
             if res and res["ids"]:
@@ -248,8 +298,11 @@ def fetch_from_chroma(thread_id):
 
 
 def fetch_recent_records(limit=100):
+    coll = get_chroma_collection()
+    if coll is None:
+        return []
     try:
-        res = get_chroma_collection().get(include=["metadatas"], limit=limit)
+        res = coll.get(include=["metadatas"], limit=limit)
         rows = list(zip(res["ids"], res["metadatas"]))
         rows.sort(key=lambda r: r[1].get("timestamp", ""), reverse=True)
         return rows
@@ -280,7 +333,7 @@ def read_file_cached(name, data):
 
 def read_prompt(raw):
     s = raw.strip()
-    if s[:1] in "{[":
+    if s[:1] in ("{", "["):
         try:
             return "json", json.loads(s)
         except ValueError:
@@ -401,7 +454,7 @@ def get_registered_font(lang):
     for path in candidates:
         if os.path.exists(path):
             try:
-                name = f"F_{abs(hash(path))}"
+                name = f"F_{zlib.crc32(path.encode('utf-8'))}"
                 pdfmetrics.registerFont(TTFont(name, path))
                 return name
             except Exception:
@@ -516,7 +569,7 @@ if st.button("🚀 Translate", type="primary"):
                 if (source, target, beam, s) in ss.tm
             }
 
-            with st.spinner("Loading translation engine (first run converts the model once)..."):
+            with st.spinner("Loading translation engine (first run may take a few minutes)..."):
                 backend = load_backend()
             st.caption(f"Engine: {'CTranslate2 int8 (fast)' if backend['kind'] == 'ct2' else 'PyTorch (fallback)'}")
 

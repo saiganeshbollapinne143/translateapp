@@ -3,3 +3,8 @@
 chroma_db/
 myenv/
 venv/
+venv/
+.venv/
+chroma_db/
+ct2_nllb_int8/
+__pycache__/
