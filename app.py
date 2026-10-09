@@ -10,7 +10,7 @@ from reportlab.platypus import SimpleDocTemplate, Paragraph, Spacer
 from reportlab.lib.styles import getSampleStyleSheet
 
 st.set_page_config(page_title="AI Translator", layout="wide")
-st.title("🌍 AI Translator — NLLB-200")
+st.title("🌍 AIT GLOBAL TECHNOLOGIES - TRANSLATOR")
 
 @st.cache_resource
 def load_model():
