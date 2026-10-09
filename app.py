@@ -4,7 +4,7 @@ import streamlit as st, torch
 from transformers import AutoTokenizer, AutoModelForSeq2SeqLM
 from pypdf import PdfReader
 from docx import Document
-from reportlab.platypus import SimpleDocTemplate, Paragraph, Spacer
+from reportlab.platypus import SimpleDocTemplate, Paragraph, Spacer, PageBreak
 from reportlab.lib.styles import getSampleStyleSheet, ParagraphStyle
 from reportlab.pdfbase import pdfmetrics
 from reportlab.pdfbase.ttfonts import TTFont
@@ -38,6 +38,20 @@ st.markdown(
     margin-bottom: 20px;
     width: 100%;
     box-sizing: border-box;
+}}
+.stream-box {{
+    background-color: #ffffff;
+    border: 1px solid #dcdcdc;
+    border-radius: 8px;
+    padding: 20px;
+    font-family: 'Courier New', Courier, monospace;
+    font-size: 13.5px;
+    line-height: 1.5;
+    white-space: pre-wrap;
+    min-height: 250px;
+    max-height: 500px;
+    overflow-y: auto;
+    color: #111111;
 }}
 </style>
 <div class="banner">
@@ -83,8 +97,6 @@ DEFAULT_FONTS = ["arial.ttf", "calibri.ttf", "segoeui.ttf"]
 @st.cache_resource
 def load_model():
     tok = AutoTokenizer.from_pretrained(MODEL_NAME, token=HF_TOKEN)
-    
-    # Load model with memory optimization to pass health checks
     model = AutoModelForSeq2SeqLM.from_pretrained(
         MODEL_NAME, token=HF_TOKEN, low_cpu_mem_usage=True
     ).eval()
@@ -94,17 +106,38 @@ def load_model():
         model = model.half().to(device)
     else:
         device = "cpu"
-        torch.set_num_threads(2)  # Prevent CPU thread competition
+        torch.set_num_threads(2)
         
     return tok, model, device
 
 def read_file(f):
+    """Extracts text while maintaining structural dividers and spacing."""
     data, n = f.getvalue(), f.name.lower()
     if n.endswith(".txt"):
         return data.decode("utf-8-sig", errors="replace")
     if n.endswith(".pdf"):
-        return "\n".join(p.extract_text() or "" for p in PdfReader(io.BytesIO(data)).pages)
-    return "\n".join(p.text for p in Document(io.BytesIO(data)).paragraphs)
+        reader = PdfReader(io.BytesIO(data))
+        pages_text = []
+        for i, p in enumerate(reader.pages):
+            txt = p.extract_text() or ""
+            pages_text.append(f"================================================================================ PAGE {i+1}\n" + txt)
+        return "\n\n".join(pages_text)
+    
+    doc = Document(io.BytesIO(data))
+    return "\n".join(p.text for p in doc.paragraphs)
+
+def is_structural_line(line):
+    """Detects headers, separators, numbers, or section marks to leave untranslated."""
+    s = line.strip()
+    if not s:
+        return True
+    if set(s) in [{'-'}, {'='}, {'*'}]:
+        return True
+    if re.match(r"^(=+|-+)\s*(PAGE|PAGINA)\s*\d+.*", s, re.IGNORECASE):
+        return True
+    if re.match(r"^\d+[\.\)]?$", s):
+        return True
+    return False
 
 def split_sentences(line, max_chars=400):
     out = []
@@ -115,6 +148,7 @@ def split_sentences(line, max_chars=400):
     return out
 
 def translate_stream(text, src, tgt, batch_size, progress_bar):
+    """Translates content line-by-line while keeping structural layouts exact."""
     tok, model, device = load_model()
     tok.src_lang = LANGS[src]
     
@@ -124,50 +158,53 @@ def translate_stream(text, src, tgt, batch_size, progress_bar):
         bos = tok.convert_tokens_to_ids(LANGS[tgt])
         
     lines = text.splitlines()
-    units = [(li, s) for li, ln in enumerate(lines) if ln.strip() for s in split_sentences(ln)]
-    
-    if not units:
-        yield ""
-        return
+    translated_lines = []
 
-    order = sorted(range(len(units)), key=lambda i: len(units[i][1]))
-    outs = [""] * len(units)
+    for idx, line in enumerate(lines):
+        if is_structural_line(line):
+            translated_lines.append(line)
+            progress_bar.progress((idx + 1) / len(lines))
+            yield "\n".join(translated_lines)
+            continue
 
-    processed = 0
-    rebuilt = {}
+        # Handle hyphenated list items
+        prefix = ""
+        content = line
+        bullet_match = re.match(r"^(\s*[-•*]\s*)(.*)", line)
+        if bullet_match:
+            prefix = bullet_match.group(1)
+            content = bullet_match.group(2)
 
-    for start in range(0, len(order), batch_size):
-        idx = order[start : start + batch_size]
-        enc = tok(
-            [units[i][1] for i in idx],
-            return_tensors="pt",
-            padding=True,
-            truncation=True,
-            max_length=256,
-        ).to(device)
+        sentences = split_sentences(content)
+        line_outs = []
 
-        with torch.inference_mode():
-            ids = model.generate(
-                **enc,
-                forced_bos_token_id=bos,
-                num_beams=1,
-                max_new_tokens=int(enc["input_ids"].shape[1] * 1.6) + 10,
-            )
+        for start in range(0, len(sentences), batch_size):
+            batch = sentences[start : start + batch_size]
+            enc = tok(
+                batch,
+                return_tensors="pt",
+                padding=True,
+                truncation=True,
+                max_length=256,
+            ).to(device)
 
-        decoded = tok.batch_decode(ids, skip_special_tokens=True)
-        for i, t in zip(idx, decoded):
-            outs[i] = t
-            li, _ = units[i]
-            rebuilt.setdefault(li, []).append(t)
+            with torch.inference_mode():
+                ids = model.generate(
+                    **enc,
+                    forced_bos_token_id=bos,
+                    num_beams=1,
+                    max_new_tokens=int(enc["input_ids"].shape[1] * 1.6) + 10,
+                )
 
-        processed += len(idx)
-        progress_bar.progress(processed / len(units))
+            decoded = tok.batch_decode(ids, skip_special_tokens=True)
+            line_outs.extend(decoded)
 
-        yield "\n".join(" ".join(rebuilt[i]) if i in rebuilt else "" for i in range(len(lines)))
+        translated_lines.append(prefix + " ".join(line_outs))
+        progress_bar.progress((idx + 1) / len(lines))
+        yield "\n".join(translated_lines)
 
-def make_pdf(text, lang):
-    font = "Helvetica"
-    
+def get_registered_font(lang):
+    """Embeds Unicode-capable TTF font for clean French accent rendering."""
     candidate_fonts = [
         "/usr/share/fonts/truetype/dejavu/DejaVuSans.ttf",
         "/usr/share/fonts/truetype/liberation/LiberationSans-Regular.ttf",
@@ -176,14 +213,23 @@ def make_pdf(text, lang):
     for path in candidate_fonts:
         if os.path.exists(path):
             try:
-                pdfmetrics.registerFont(TTFont("UF", path))
-                font = "UF"
-                break
+                font_name = f"CustomFont_{uuid.uuid4().hex[:6]}"
+                pdfmetrics.registerFont(TTFont(font_name, path))
+                return font_name
             except Exception:
                 pass
+    return "Helvetica"
+
+def make_pdf(text, lang):
+    """Outputs a clean PDF matching the plain-text/doc layout structure."""
+    font_name = get_registered_font(lang)
 
     style = ParagraphStyle(
-        "u", parent=getSampleStyleSheet()["Normal"], fontName=font, fontSize=11, leading=16
+        "ClientTextFormat",
+        parent=getSampleStyleSheet()["Normal"],
+        fontName=font_name,
+        fontSize=9.5,
+        leading=13.5,
     )
     
     rtl = lang == "Arabic"
@@ -197,19 +243,40 @@ def make_pdf(text, lang):
     story = []
     
     for line in text.splitlines():
+        if re.match(r"^(=+|-+)\s*(PAGE|PAGINA)\s*\d+.*", line, re.IGNORECASE):
+            story.append(Spacer(1, 6))
+            story.append(PageBreak())
+
         if rtl and line.strip():
             line = get_display(arabic_reshaper.reshape(line))
-        safe = line.replace("&", "&amp;").replace("<", "&lt;").replace(">", "&gt;") or " "
+            
+        safe = (
+            line.replace("&", "&amp;")
+            .replace("<", "&lt;")
+            .replace(">", "&gt;")
+            or " "
+        )
         story.append(Paragraph(safe, style))
-        story.append(Spacer(1, 4))
+        story.append(Spacer(1, 2))
 
-    SimpleDocTemplate(out).build(story)
+    doc = SimpleDocTemplate(
+        out,
+        leftMargin=36,
+        rightMargin=36,
+        topMargin=36,
+        bottomMargin=36
+    )
+    doc.build(story)
     return out.getvalue()
 
 def make_docx(text):
     out, doc = io.BytesIO(), Document()
     for line in text.splitlines():
-        doc.add_paragraph(line)
+        if re.match(r"^(=+|-+)\s*(PAGE|PAGINA)\s*\d+.*", line, re.IGNORECASE):
+            doc.add_page_break()
+            doc.add_paragraph(line)
+        else:
+            doc.add_paragraph(line)
     doc.save(out)
     return out.getvalue()
 
@@ -244,7 +311,10 @@ if st.button("🚀 Translate", type="primary"):
             final_text = ""
             for partial_translation in translate_stream(text, source, target, batch_size, bar):
                 final_text = partial_translation
-                output_container.text_area("Live Translation Stream", value=final_text, height=250)
+                output_container.markdown(
+                    f'<div class="stream-box">{final_text}</div>',
+                    unsafe_allow_html=True,
+                )
 
             bar.empty()
             tid = str(uuid.uuid4())
