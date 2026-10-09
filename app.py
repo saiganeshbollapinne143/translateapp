@@ -35,7 +35,7 @@ def ist_now():
         "%d-%m-%Y %I:%M:%S %p IST"
     )
 
-@st.cache_resource(show_spinner="Translating....")
+@st.cache_resource(show_spinner="Loading NLLB-200 model...")
 def load_model():
     device = "cuda" if torch.cuda.is_available() else "cpu"
     tokenizer = AutoTokenizer.from_pretrained(MODEL_NAME)
@@ -48,7 +48,8 @@ def load_model():
     model.eval()
     return tokenizer, model, device
 
-def split_text(text, limit=700):
+def split_text(text, limit=250):
+    # Split on sentence boundaries, then split oversized sentences safely.
     pieces = re.split(r"(?<=[.!?。！？])\s+|\n+", text.strip())
     chunks = []
     current = ""
@@ -64,7 +65,9 @@ def split_text(text, limit=700):
                 current = ""
 
             cut = piece.rfind(" ", 0, limit)
-            cut = cut if cut > 0 else limit
+            if cut <= 0:
+                cut = limit
+
             chunks.append(piece[:cut].strip())
             piece = piece[cut:].strip()
 
@@ -101,31 +104,31 @@ def new_thread():
 
 # ---------- UI ----------
 st.title("🌍 AIT GLOBAL TECHNOLOGIES")
-st.caption("NLLB-200 AI Translator | Live chunk-by-chunk output")
+st.caption("NLLB-200 Translator | Live chunk-by-chunk translation")
 
-col1, col2 = st.columns([3, 1])
+left, right = st.columns([3, 1])
 
-with col1:
-    st.write("**Thread ID:**")
+with left:
+    st.write("**Thread ID**")
     st.code(st.session_state.thread_id)
 
-with col2:
+with right:
     st.button(
         "➕ New Thread",
         on_click=new_thread,
         use_container_width=True
     )
 
-col1, col2 = st.columns(2)
+left, right = st.columns(2)
 
-with col1:
+with left:
     source_name = st.selectbox(
         "Source language",
         list(LANGS.keys()),
         index=0
     )
 
-with col2:
+with right:
     target_name = st.selectbox(
         "Target language",
         list(LANGS.keys()),
@@ -143,13 +146,6 @@ manual_text = st.text_area(
     placeholder="Paste your document text here..."
 )
 
-batch_size = st.select_slider(
-    "Processing batch size",
-    options=[1, 2, 3, 4],
-    value=1,
-    help="Use 1 for frequent updates and lower memory use."
-)
-
 text_input = manual_text
 filename = "pasted_text.txt"
 
@@ -161,92 +157,86 @@ if uploaded is not None:
         text_input = ""
         st.error("Please save the TXT file as UTF-8 and upload it again.")
 
-# ---------- TRANSLATION ----------
-if st.button(
-    "🚀 Translate",
-    type="primary",
-    use_container_width=True
-):
+# ---------- TRANSLATE ----------
+if st.button("🚀 Translate", type="primary", use_container_width=True):
     if not text_input.strip():
-        st.warning("Upload a TXT document or paste text first.")
+        st.warning("Upload a TXT file or paste text first.")
 
     elif source_name == target_name:
         st.warning("Choose different source and target languages.")
 
     else:
+        progress = st.progress(0)
+        status = st.empty()
+        live_area = st.empty()
+
         try:
+            status.info("Loading translation model...")
             tokenizer, model, device = load_model()
-            chunks = split_text(text_input)
+
+            chunks = split_text(text_input, limit=250)
 
             if not chunks:
                 st.warning("No text found to translate.")
                 st.stop()
 
-            st.info(
-                f"Device: {device.upper()} | "
-                f"Total chunks: {len(chunks)}"
+            total = len(chunks)
+            translated_parts = []
+            started = time.time()
+
+            status.info(
+                f"Model ready on {device.upper()}. "
+                f"Translating {total} chunks..."
             )
 
-            progress = st.progress(0)
-            status = st.empty()
-            output_box = st.empty()
-
-            translated_parts = []
-            start = time.time()
-
-            for start_idx in range(0, len(chunks), batch_size):
-                batch = chunks[start_idx:start_idx + batch_size]
+            for i, chunk in enumerate(chunks):
+                status.info(
+                    f"Translating chunk {i + 1}/{total}..."
+                )
 
                 tokenizer.src_lang = LANGS[source_name]
 
-                encoded = tokenizer(
-                    batch,
+                inputs = tokenizer(
+                    chunk,
                     return_tensors="pt",
-                    padding=True,
                     truncation=True,
                     max_length=512
                 ).to(device)
 
                 with torch.inference_mode():
-                    generated = model.generate(
-                        **encoded,
+                    output = model.generate(
+                        **inputs,
                         forced_bos_token_id=tokenizer.convert_tokens_to_ids(
                             LANGS[target_name]
                         ),
-                        max_new_tokens=384,
+                        max_new_tokens=256,
                         num_beams=1,
                         do_sample=False
                     )
 
-                translated_parts.extend(
-                    tokenizer.batch_decode(
-                        generated,
-                        skip_special_tokens=True
-                    )
+                translated_chunk = tokenizer.decode(
+                    output[0],
+                    skip_special_tokens=True
                 )
 
-                completed = len(translated_parts)
-                current_output = "\n\n".join(translated_parts)
+                translated_parts.append(translated_chunk)
+                current_result = "\n\n".join(translated_parts)
 
-                # Show translated text after each completed batch
-                with output_box.container():
+                # Display completed chunks immediately.
+                with live_area.container():
+                    st.markdown("### 🔄 Streaming Translation")
                     st.text_area(
-                        "🔄 Streaming Translation",
-                        value=current_output,
-                        height=280
+                        "Translated text so far",
+                        value=current_result,
+                        height=280,
+                        key=f"live_{st.session_state.thread_id}_{i}"
                     )
 
-                progress.progress(
-                    min(completed / len(chunks), 1.0)
-                )
-
-                status.info(
-                    f"Translating: {completed}/{len(chunks)} "
-                    f"chunks completed"
-                )
+                # Progress updates only after each chunk is generated.
+                progress.progress((i + 1) / total)
 
             result = "\n\n".join(translated_parts)
-            duration = round(time.time() - start, 2)
+            duration = round(time.time() - started, 2)
 
             st.session_state.last_result = result
             st.session_state.last_filename = (
@@ -258,25 +248,25 @@ if st.button(
                 "file": filename,
                 "source": source_name,
                 "target": target_name,
-                "chunks": len(chunks),
+                "chunks": total,
                 "seconds": duration,
                 "time": ist_now()
             })
 
-            progress.progress(1.0)
             status.success(
                 f"✅ Translation completed in {duration} seconds."
             )
 
         except Exception as e:
-            st.error(f"Translation failed: {e}")
+            status.error("Translation failed.")
+            st.exception(e)
 
-# ---------- FINAL RESULT ----------
+# ---------- FINAL OUTPUT ----------
 if st.session_state.last_result:
-    st.subheader("✅ Translated Document")
+    st.subheader("✅ Completed Translation")
 
     st.text_area(
-        "Final translation",
+        "Final translated document",
         value=st.session_state.last_result,
         height=300,
         key="final_translation"
@@ -298,7 +288,6 @@ with st.expander("🕘 Translation History"):
                 f"**{item['source']} → {item['target']}** | "
                 f"{item['file']} | {item['seconds']} seconds"
             )
-
             st.caption(
                 f"Thread: {item['thread']} | "
                 f"Chunks: {item['chunks']} | "
