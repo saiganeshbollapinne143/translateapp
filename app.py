@@ -142,6 +142,40 @@ def import_thread():
     st.session_state.system_note = d.get("system_note", "")
     st.session_state.import_msg = ("success", "Thread imported.")
 
+PRESETS = {
+    "Plain (no wrapper)": "{text}",
+    "Formal letter": "Dear Sir/Madam,\n\n{text}\n\nYours faithfully,\nAIT Global Technologies",
+    "Email": "Hello,\n\n{text}\n\nBest regards,\nAIT Global Technologies",
+    "Official notice": "NOTICE\n\n{text}\n\nBy order of AIT Global Technologies",
+    "Custom": None,
+}
+
+def apply_preset():
+    tpl = PRESETS[st.session_state.preset]
+    if tpl is not None:
+        st.session_state.template = tpl
+
+def load_prompt_file():
+    f = st.session_state.get("prompt_file")
+    if f is None: return
+    ext = f.name.rsplit(".", 1)[-1].lower()
+    try:
+        text = READERS[ext](f.getvalue()).strip()
+    except Exception as e:
+        st.session_state.prompt_msg = ("error", f"Could not read {f.name}: {e}")
+        return
+    if not text:
+        st.session_state.prompt_msg = ("error", f"{f.name} has no text.")
+        return
+    if "{text}" in text:
+        st.session_state.prompt_msg = ("success", f"Prompt loaded from {f.name}.")
+    else:
+        text += "\n\n{text}"
+        st.session_state.prompt_msg = ("warning", f"No {{text}} found in {f.name}, so it was added at the end.")
+    st.session_state.template = text
+    st.session_state.preset = "Custom"
+
+if "template" not in st.session_state: st.session_state.template = "{text}"
 if "thread_id" not in st.session_state: st.session_state.thread_id = str(uuid.uuid4())
 if "history" not in st.session_state: st.session_state.history = []
 if "translated" not in st.session_state: st.session_state.translated = ""
@@ -154,7 +188,13 @@ with st.sidebar:
     chunk_size = st.slider("Chunk size", 300, 2500, 800, 100, key="chunk")
     max_tokens = st.slider("Maximum output tokens", 128, 512, 256, 32, key="tokens")
     st.subheader("🧩 Prompt & system")
-    st.text_area("Prompt template (must contain {text})", value="{text}", key="template", height=90)
+    st.selectbox("Template preset", list(PRESETS), key="preset", on_change=apply_preset)
+    st.file_uploader("Or upload a prompt file", type=["txt", "docx", "pdf"],
+                     key="prompt_file", on_change=load_prompt_file)
+    if "prompt_msg" in st.session_state:
+        kind, msg = st.session_state.pop("prompt_msg")
+        getattr(st, kind)(msg)
+    st.text_area("Prompt template (must contain {text})", key="template", height=130)
     st.text_area("System note (added to PDF, not translated)", key="system_note", height=70,
                  placeholder="e.g. Official translation for AIT Global internal use")
     st.subheader("📥 Import thread")
