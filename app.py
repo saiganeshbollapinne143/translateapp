@@ -12,13 +12,50 @@ from reportlab.pdfbase.ttfonts import TTFont
 
 st.set_page_config(page_title="AI Translator", page_icon="🌍", layout="wide")
 st.markdown("""
-<style>
-.block-container {padding-top: 2rem; max-width: 1100px;}
-h1 {background: linear-gradient(90deg,#2563eb,#7c3aed); -webkit-background-clip: text;
-    -webkit-text-fill-color: transparent; font-weight: 800;}
-.stButton>button {border-radius: 10px; font-weight: 600;}
-</style>
+
+<h1 style="font-size:32px; font-weight:800; margin-bottom:20px;">
+    <span style="color:#0B2D5C;">AIT</span>
+    <span style="color:#FFD700;"> GLOBAL</span>
+    <span style="color:#000000;"> TECHNOLOGIES - TRANSLATOR</span>
+</h1>
 """, unsafe_allow_html=True)
+st.markdown("""
+
+<h1 style="font-size:32px; font-weight:800; margin-bottom:20px;">
+    <span style="color:#0B2D5C;">AIT</span>
+    <span style="color:#FFD700;"> GLOBAL</span>
+    <span style="color:#000000;"> TECHNOLOGIES - TRANSLATOR</span>
+</h1>
+""", unsafe_allow_html=True)
+st.markdown("""
+
+<h1 style="font-size:32px; font-weight:800; margin-bottom:20px;">
+    <span style="color:#0B2D5C;">AIT</span>
+    <span style="color:#FFD700;"> GLOBAL</span>
+    <span style="color:#000000;"> TECHNOLOGIES - TRANSLATOR</span>
+</h1>
+""", unsafe_allow_html=True)
+st.markdown("""
+
+<h1 style="font-size:32px; font-weight:800; margin-bottom:20px;">
+    <span style="color:#0B2D5C;">AIT</span>
+    <span style="color:#FFD700;"> GLOBAL</span>
+    <span style="color:#000000;"> TECHNOLOGIES - TRANSLATOR</span>
+</h1>
+""", unsafe_allow_html=True)
+st.markdown("""
+
+<h1 style="font-size:32px; font-weight:800; margin-bottom:20px;">
+    <span style="color:#0B2D5C;">AIT</span>
+    <span style="color:#FFD700;"> GLOBAL</span>
+    <span style="color:#000000;"> TECHNOLOGIES - TRANSLATOR</span>
+</h1>
+""", unsafe_allow_html=True)
+st.markdown("""
+
+<h1 style="font-size:32px; font-weight:800; margin-bottom:20px;"> 
+<span style="color:#0B2D5C;">AIT</span> <span style="color:#FFD700;"> 
+GLOBAL</span> <span style="color:#000000;"> TECHNOLOGIES - TRANSLATOR</span> </h1> """, unsafe_allow_html=True)
 st.title("🌍 AIT GLOBAL TECHNOLOGIES - TRANSLATOR")
 
 LANGS = {
