@@ -10,19 +10,17 @@ from reportlab.pdfbase import pdfmetrics
 from reportlab.pdfbase.ttfonts import TTFont
 
 # -----------------------------------------------------------------------------
-# SECRETS MANAGEMENT
+# SECRETS & CONFIGURATION MANAGEMENT
 # -----------------------------------------------------------------------------
-# Safely load secrets from st.secrets with fallback defaults
 HF_TOKEN = st.secrets.get("HF_TOKEN", None)
 COMPANY_NAME = st.secrets.get("COMPANY_NAME", "AIT GLOBAL")
 APP_TITLE = st.secrets.get("APP_TITLE", "AIT GLOBAL TECHNOLOGIES - TRANSLATOR")
 MODEL_NAME = st.secrets.get("MODEL_NAME", "facebook/nllb-200-distilled-600M")
 DEFAULT_BATCH_SIZE = int(st.secrets.get("DEFAULT_BATCH_SIZE", 8))
-API_KEY = st.secrets.get("API_KEY", "")
 
 st.set_page_config(page_title="AI Translator", page_icon="🌍", layout="wide")
 
-# Custom CSS styling with dynamic company name from secrets
+# Custom CSS styling matching your banner specification
 st.markdown(
     f"""
 <style>
@@ -84,18 +82,19 @@ DEFAULT_FONTS = ["arial.ttf", "calibri.ttf", "segoeui.ttf"]
 # -----------------------------------------------------------------------------
 @st.cache_resource
 def load_model():
-    # Pass HF_TOKEN from secrets to authenticate model weight downloads
     tok = AutoTokenizer.from_pretrained(MODEL_NAME, token=HF_TOKEN)
-    model = AutoModelForSeq2SeqLM.from_pretrained(MODEL_NAME, token=HF_TOKEN).eval()
+    
+    # Load model with memory optimization to pass health checks
+    model = AutoModelForSeq2SeqLM.from_pretrained(
+        MODEL_NAME, token=HF_TOKEN, low_cpu_mem_usage=True
+    ).eval()
     
     if torch.cuda.is_available():
         device = "cuda"
         model = model.half().to(device)
     else:
         device = "cpu"
-        torch.set_num_threads(os.cpu_count() or 4)
-        import torch.ao.quantization as ao_quant
-        model = ao_quant.quantize_dynamic(model, {torch.nn.Linear}, dtype=torch.qint8)
+        torch.set_num_threads(2)  # Prevent CPU thread competition
         
     return tok, model, device
 
@@ -116,13 +115,17 @@ def split_sentences(line, max_chars=400):
     return out
 
 def translate_stream(text, src, tgt, batch_size, progress_bar):
-    """Yields intermediate translation text line-by-line for real-time streaming."""
     tok, model, device = load_model()
     tok.src_lang = LANGS[src]
-    bos = tok.convert_tokens_to_ids(LANGS[tgt])
+    
+    if hasattr(tok, "lang_code_to_id"):
+        bos = tok.lang_code_to_id[LANGS[tgt]]
+    else:
+        bos = tok.convert_tokens_to_ids(LANGS[tgt])
+        
     lines = text.splitlines()
-
     units = [(li, s) for li, ln in enumerate(lines) if ln.strip() for s in split_sentences(ln)]
+    
     if not units:
         yield ""
         return
@@ -160,13 +163,17 @@ def translate_stream(text, src, tgt, batch_size, progress_bar):
         processed += len(idx)
         progress_bar.progress(processed / len(units))
 
-        # Stream accumulated output
         yield "\n".join(" ".join(rebuilt[i]) if i in rebuilt else "" for i in range(len(lines)))
 
 def make_pdf(text, lang):
     font = "Helvetica"
-    for f in FONTS.get(lang, []) + DEFAULT_FONTS:
-        path = os.path.join(WIN, f)
+    
+    candidate_fonts = [
+        "/usr/share/fonts/truetype/dejavu/DejaVuSans.ttf",
+        "/usr/share/fonts/truetype/liberation/LiberationSans-Regular.ttf",
+    ] + [os.path.join(WIN, f) for f in FONTS.get(lang, []) + DEFAULT_FONTS]
+    
+    for path in candidate_fonts:
         if os.path.exists(path):
             try:
                 pdfmetrics.registerFont(TTFont("UF", path))
@@ -174,7 +181,11 @@ def make_pdf(text, lang):
                 break
             except Exception:
                 pass
-    style = ParagraphStyle("u", parent=getSampleStyleSheet()["Normal"], fontName=font, fontSize=11, leading=16)
+
+    style = ParagraphStyle(
+        "u", parent=getSampleStyleSheet()["Normal"], fontName=font, fontSize=11, leading=16
+    )
+    
     rtl = lang == "Arabic"
     if rtl:
         try:
@@ -184,11 +195,14 @@ def make_pdf(text, lang):
 
     out = io.BytesIO()
     story = []
+    
     for line in text.splitlines():
         if rtl and line.strip():
             line = get_display(arabic_reshaper.reshape(line))
         safe = line.replace("&", "&amp;").replace("<", "&lt;").replace(">", "&gt;") or " "
-        story += [Paragraph(safe, style), Spacer(1, 4)]
+        story.append(Paragraph(safe, style))
+        story.append(Spacer(1, 4))
+
     SimpleDocTemplate(out).build(story)
     return out.getvalue()
 
