@@ -86,7 +86,7 @@ def new_thread():
     st.session_state.thread_id = str(uuid.uuid4())
     st.session_state.last_result = ""
 
-st.title("🌍 NLLB-200 Document Translator")
+st.title("🌍 AIT GLOBAL TECHNOLOGIES")
 st.caption("Translate text documents with live chunk progress.")
 
 c1, c2 = st.columns([3, 1])
