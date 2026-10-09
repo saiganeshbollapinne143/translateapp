@@ -17,8 +17,8 @@ st.set_page_config(
 )
 
 st.title("🌍 AIT GLOBAL TECHNOLOGIES")
-st.subheader("Quality-Focused AI Document Translator")
-st.caption("NLLB-200 | CPU Optimized | Sentence-Aware Chunk Translation")
+st.subheader("AI Document Translator")
+st.caption("Sentence-Aware Chunk Translation")
 
 MODEL_NAME = "facebook/nllb-200-distilled-600M"
 CHUNK_SIZE = 700
