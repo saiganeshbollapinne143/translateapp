@@ -1,153 +1,112 @@
-import io, uuid, time
+
+import io, re, uuid
 from datetime import datetime
 import streamlit as st
 import torch
 from transformers import AutoTokenizer, AutoModelForSeq2SeqLM
+from pypdf import PdfReader
+from docx import Document
 from reportlab.platypus import SimpleDocTemplate, Paragraph, Spacer
 from reportlab.lib.styles import getSampleStyleSheet
-from reportlab.lib.pagesizes import A4
-from xml.sax.saxutils import escape
 
 st.set_page_config(page_title="AI Translator", layout="wide")
-st.title("🌍 AIT GLOBAL — AI Translator")
+st.title("🌍 AI Translator — NLLB-200")
 
-MODEL = "facebook/nllb-200-distilled-600M"
+@st.cache_resource
+def load_model():
+    name = "facebook/nllb-200-distilled-600M"
+    tok = AutoTokenizer.from_pretrained(name)
+    model = AutoModelForSeq2SeqLM.from_pretrained(name)
+    model.eval()
+    return tok, model
+
 LANGS = {
     "English": "eng_Latn", "Tamil": "tam_Taml",
     "Hindi": "hin_Deva", "Telugu": "tel_Telu",
-    "Malayalam": "mal_Mlym", "Kannada": "kan_Knda",
-    "French": "fra_Latn", "German": "deu_Latn",
-    "Spanish": "spa_Latn", "Arabic": "arb_Arab",
-    "Chinese": "zho_Hans", "Japanese": "jpn_Jpan",
+    "French": "fra_Latn", "Spanish": "spa_Latn",
+    "German": "deu_Latn", "Chinese": "zho_Hans",
+    "Arabic": "arb_Arab", "Japanese": "jpn_Jpan",
     "Korean": "kor_Hang", "Portuguese": "por_Latn",
     "Russian": "rus_Cyrl", "Italian": "ita_Latn"
 }
 
-@st.cache_resource
-def load_model():
-    tok = AutoTokenizer.from_pretrained(MODEL)
-    model = AutoModelForSeq2SeqLM.from_pretrained(MODEL)
-    model.eval()
-    return tok, model
+source = st.selectbox("Input language", list(LANGS), index=0)
+target = st.selectbox("Translate into", list(LANGS), index=1)
+uploaded = st.file_uploader("Upload PDF, TXT, or DOCX", type=["pdf", "txt", "docx"])
+prompt = st.text_area("Or enter text to translate", height=150)
+max_tokens = st.selectbox("Maximum output tokens per chunk", [256, 512, 800], index=0)
+chunk_size = st.selectbox("Input chunk size (characters)", [500, 1000, 1500], index=1)
+
+def read_file(file):
+    data = file.getvalue()
+    if file.name.lower().endswith(".txt"):
+        return data.decode("utf-8-sig", errors="replace")
+    if file.name.lower().endswith(".pdf"):
+        return "\n".join(p.extract_text() or "" for p in PdfReader(io.BytesIO(data)).pages)
+    doc = Document(io.BytesIO(data))
+    return "\n".join(p.text for p in doc.paragraphs)
+
+def make_pdf(text):
+    out = io.BytesIO()
+    doc = SimpleDocTemplate(out)
+    styles = getSampleStyleSheet()
+    story = []
+    for line in text.splitlines():
+        story += [Paragraph(line.replace("&", "&amp;").replace("<", "&lt;").replace(">", "&gt;") or " ", styles["Normal"]), Spacer(1, 5)]
+    doc.build(story)
+    return out.getvalue()
+
+def make_docx(text):
+    out = io.BytesIO()
+    doc = Document()
+    for line in text.splitlines():
+        doc.add_paragraph(line)
+    doc.save(out)
+    return out.getvalue()
 
 if "history" not in st.session_state:
     st.session_state.history = []
-if "thread_id" not in st.session_state:
-    st.session_state.thread_id = str(uuid.uuid4())[:8]
 
-st.caption(f"Thread ID: {st.session_state.thread_id}")
-source = st.selectbox("Source language", list(LANGS), index=0)
-target = st.selectbox("Target language", list(LANGS), index=1)
-uploaded = st.file_uploader("Upload TXT file (optional)", type=["txt"])
-prompt = st.text_area("Enter text to translate", height=150,
-                      placeholder="Type or paste your text here...")
-text = uploaded.getvalue().decode("utf-8", errors="replace") if uploaded else prompt
-
-if st.button("🔄 New Thread"):
-    st.session_state.thread_id = str(uuid.uuid4())[:8]
-    st.session_state.history = []
-    st.rerun()
-
-if st.button("🌐 Translate", type="primary", disabled=not text.strip()):
-    if source == target:
-        st.warning("Choose different source and target languages.")
+if st.button("🚀 Translate", type="primary"):
+    text = read_file(uploaded) if uploaded else prompt
+    if not text.strip():
+        st.error("Upload a file or enter text first.")
+    elif source == target:
+        st.warning("Choose different input and output languages.")
     else:
         try:
-            with st.spinner("Loading translation model (first run may take time)..."):
-                tokenizer, model = load_model()
-
-            # Split into manageable chunks, preserving paragraph boundaries.
-            chunks, current = [], ""
-            for paragraph in text.splitlines():
-                paragraph = paragraph.strip()
-                if not paragraph:
-                    continue
-                while len(paragraph) > 900:
-                    if current:
-                        chunks.append(current)
-                        current = ""
-                    chunks.append(paragraph[:900])
-                    paragraph = paragraph[900:]
-                if len(current) + len(paragraph) + 1 > 900:
-                    if current:
-                        chunks.append(current)
-                    current = paragraph
-                else:
-                    current = (current + "\n" + paragraph).strip()
-            if current:
-                chunks.append(current)
-            if not chunks:
-                chunks = [text.strip()]
-
-            progress = st.progress(0)
+            with st.spinner("Loading NLLB-200 model (first run may take time)..."):
+                tok, model = load_model()
+            tok.src_lang = LANGS[source]
+            chunks = [text[i:i + chunk_size] for i in range(0, len(text), chunk_size)]
+            result, progress = [], st.progress(0)
+            output_area = st.empty()
             status = st.empty()
-            output = st.empty()
-            results = []
-
             for i, chunk in enumerate(chunks):
-                status.info(f"Translating chunk {i+1}/{len(chunks)}...")
-                tokenizer.src_lang = LANGS[source]
-                inputs = tokenizer(chunk, return_tensors="pt",
-                                   truncation=True, max_length=512)
-                with torch.inference_mode():
-                    generated = model.generate(
+                inputs = tok(chunk, return_tensors="pt", truncation=True, max_length=256)
+                with torch.no_grad():
+                    ids = model.generate(
                         **inputs,
-                        forced_bos_token_id=tokenizer.convert_tokens_to_ids(
-                            LANGS[target]),
-                        max_new_tokens=256,
+                        forced_bos_token_id=tok.convert_tokens_to_ids(LANGS[target]),
+                        max_new_tokens=max_tokens,
                         num_beams=2
                     )
-                result = tokenizer.batch_decode(
-                    generated, skip_special_tokens=True
-                )[0]
-                results.append(result)
+                result.append(tok.batch_decode(ids, skip_special_tokens=True)[0])
+                output_area.text_area("Translation in progress", "\n\n".join(result), height=250)
                 progress.progress((i + 1) / len(chunks))
-                output.markdown("**Latest translated chunk:**\n\n" + result)
-                status.write(f"Completed {i+1}/{len(chunks)} chunks")
-
-            translated = "\n\n".join(results)
-            st.session_state.history.insert(0, {
-                "time": datetime.now().strftime("%Y-%m-%d %H:%M:%S"),
-                "thread": st.session_state.thread_id,
-                "source": source, "target": target,
-                "input": text, "output": translated
+                status.write(f"Translated chunk {i + 1} of {len(chunks)}")
+            translated = "\n\n".join(result)
+            st.success("Translation completed!")
+            st.text_area("Final translation", translated, height=300)
+            st.download_button("Download PDF", make_pdf(translated), "translation.pdf", "application/pdf")
+            st.download_button("Download DOCX", make_docx(translated), "translation.docx", "application/vnd.openxmlformats-officedocument.wordprocessingml.document")
+            st.session_state.history.append({
+                "thread_id": str(uuid.uuid4()), "time": datetime.now().strftime("%Y-%m-%d %H:%M:%S"),
+                "source": source, "target": target, "chunks": len(chunks)
             })
-            st.subheader("✅ Complete Translation")
-            st.text_area("Translated text", translated, height=250)
-            status.success(f"Finished translating {len(chunks)} chunks!")
-
-            # Create downloadable PDF
-            buffer = io.BytesIO()
-            doc = SimpleDocTemplate(buffer, pagesize=A4)
-            styles = getSampleStyleSheet()
-            story = [Paragraph("AI Translator — Translation", styles["Title"]),
-                     Spacer(1, 12),
-                     Paragraph(f"{escape(source)} to {escape(target)}", styles["Heading2"]),
-                     Spacer(1, 12)]
-            for paragraph in translated.split("\n"):
-                story.append(Paragraph(escape(paragraph) or " ", styles["BodyText"]))
-                story.append(Spacer(1, 6))
-            doc.build(story)
-            st.download_button(
-                "📄 Download translated PDF",
-                data=buffer.getvalue(),
-                file_name="translated_document.pdf",
-                mime="application/pdf"
-            )
-            st.download_button(
-                "⬇️ Download translated TXT",
-                data=translated.encode("utf-8"),
-                file_name="translated.txt",
-                mime="text/plain"
-            )
         except Exception as e:
             st.error(f"Translation failed: {e}")
 
-if st.session_state.history:
-    st.subheader("🕘 Translation History")
-    for item in st.session_state.history:
-        with st.expander(f"{item['time']} | {item['source']} → {item['target']}"):
-            st.caption(f"Thread ID: {item['thread']}")
-            st.write("**Input:**", item["input"][:1000])
-            st.write("**Translation:**", item["output"][:2000])
+with st.expander("Translation history"):
+    st.write(st.session_state.history or "No translations yet.")
 
