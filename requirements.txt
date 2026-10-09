@@ -1,10 +1,8 @@
-﻿--extra-index-url https://download.pytorch.org/whl/cpu
+﻿streamlit
 torch
 transformers
-accelerate
-sentencepiece
-sacremoses
-streamlit
 pypdf
 python-docx
 reportlab
+sentencepiece
+sacremoses
