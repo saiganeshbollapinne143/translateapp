@@ -1,5 +1,5 @@
 # -----------------------------------------------------------------------------
-# SQLITE PATCH FOR CHROMADB COMPATIBILITY (MUST BE AT TOP)
+# SQLITE PATCH FOR CHROMADB COMPATIBILITY (MUST BE AT VERY TOP)
 # -----------------------------------------------------------------------------
 try:
     __import__('pysqlite3')
@@ -108,13 +108,13 @@ DEFAULT_FONTS = ["arial.ttf", "calibri.ttf", "segoeui.ttf"]
 # -----------------------------------------------------------------------------
 @st.cache_resource
 def get_chroma_collection():
-    """Initializes local ChromaDB client and collection."""
+    """Initializes local ChromaDB client and persistent collection."""
     client = chromadb.PersistentClient(path="./chroma_db")
     return client.get_or_create_collection(name="translation_history")
 
 @st.cache_resource
 def load_model():
-    """Loads tokenizer and Seq2Seq model into memory with GPU optimizations."""
+    """Loads tokenizer and Seq2Seq model into GPU/CPU memory with optimization."""
     tok = AutoTokenizer.from_pretrained(MODEL_NAME, token=HF_TOKEN)
     model = AutoModelForSeq2SeqLM.from_pretrained(
         MODEL_NAME, token=HF_TOKEN, low_cpu_mem_usage=True
@@ -138,7 +138,7 @@ def load_model():
 # HELPER FUNCTIONS
 # -----------------------------------------------------------------------------
 def read_file(f):
-    """Extracts text while maintaining structural dividers and spacing."""
+    """Extracts raw text while preserving structural layout and dividers."""
     data, n = f.getvalue(), f.name.lower()
     if n.endswith(".txt"):
         return data.decode("utf-8-sig", errors="replace")
@@ -154,14 +154,14 @@ def read_file(f):
     return "\n".join(p.text for p in doc.paragraphs)
 
 def is_structural_line(line):
-    """Detects structural components to bypass translation."""
+    """Detects page markers, separators, or structural numbers to bypass translation."""
     s = line.strip()
     if not s or set(s) in [{'-'}, {'='}, {'*'}] or re.match(r"^(=+|-+)\s*(PAGE|PAGINA)\s*\d+.*", s, re.IGNORECASE) or re.match(r"^\d+[\.\)]?$", s):
         return True
     return False
 
 def split_sentences(line, max_chars=512):
-    """Splits sentences into length-controlled chunks."""
+    """Splits long lines into context-sized sentence chunks."""
     out = []
     for s in re.split(r"(?<=[.!?।。！？؟])\s*", line):
         s = s.strip()
@@ -170,7 +170,7 @@ def split_sentences(line, max_chars=512):
     return out
 
 def translate_stream(text, src, tgt, batch_size, progress_bar):
-    """Batches translation calls for optimal performance while yielding updates."""
+    """Batches non-structural text for parallelized token processing."""
     tok, model, device = load_model()
     tok.src_lang = LANGS[src]
     
@@ -237,6 +237,7 @@ def translate_stream(text, src, tgt, batch_size, progress_bar):
 # PERSISTENCE & EXPORT FUNCTIONS
 # -----------------------------------------------------------------------------
 def save_to_chroma(thread_id, source, target, original, translated):
+    """Saves completed translation to persistent ChromaDB collection."""
     collection = get_chroma_collection()
     collection.add(
         documents=[translated],
@@ -250,6 +251,7 @@ def save_to_chroma(thread_id, source, target, original, translated):
     )
 
 def fetch_from_chroma(thread_id):
+    """Fetches document metadata and text from ChromaDB using System Thread ID."""
     collection = get_chroma_collection()
     res = collection.get(ids=[thread_id])
     if res and res["ids"]:
@@ -257,6 +259,7 @@ def fetch_from_chroma(thread_id):
     return None
 
 def fetch_all_chroma_records():
+    """Retrieves all historical translation records."""
     return get_chroma_collection().get()
 
 def get_registered_font(lang):
@@ -343,7 +346,7 @@ if st.button("🚀 Translate", type="primary"):
         st.warning("Choose different input and output languages.")
     else:
         try:
-            with st.spinner("Initializing accelerated translation engine..."):
+            with st.spinner("Initializing translation engine..."):
                 load_model()
 
             bar = st.progress(0)
@@ -359,6 +362,7 @@ if st.button("🚀 Translate", type="primary"):
 
             bar.empty()
             
+            # Automatically assign System Thread ID and record in ChromaDB
             auto_thread_id = f"TR-{uuid.uuid4().hex[:10].upper()}"
             save_to_chroma(auto_thread_id, source, target, text, final_text)
             
