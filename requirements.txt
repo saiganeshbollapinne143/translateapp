@@ -2,7 +2,6 @@
 torch
 transformers
 chromadb
-pysqlite3-binary
 pypdf
 python-docx
 reportlab
