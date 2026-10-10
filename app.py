@@ -335,6 +335,18 @@ tgt_name = col2.selectbox("Translate to", list(LANGUAGES), index=1)
 uploaded = st.file_uploader("Upload a file", type=["pdf", "txt", "docx", "json"])
 typed = st.text_area("...or paste text", height=120)
 
+# Persistent streaming output area (only output on UI)
+st.subheader("Streaming Output")
+output_placeholder = st.empty()
+if "streamed_text" not in st.session_state:
+    st.session_state["streamed_text"] = ""
+output_placeholder.text_area(
+    "Output (streaming...)",
+    st.session_state["streamed_text"],
+    height=220,
+    key="stream_out",
+)
+
 if st.button("Translate", type="primary"):
     if src_name == tgt_name:
         st.info("Source and target languages are the same.")
@@ -342,7 +354,8 @@ if st.button("Translate", type="primary"):
         st.warning("Upload a file or paste some text first.")
     else:
         st.session_state.pop("result", None)
-        
+        st.session_state["streamed_text"] = ""
+
         try:
             kind, content = read_upload(uploaded) if uploaded else ("txt", typed)
         except Exception as e:
@@ -351,10 +364,6 @@ if st.button("Translate", type="primary"):
 
         src, tgt = LANGUAGES[src_name], LANGUAGES[tgt_name]
         bar = st.progress(0.0, text="Translating...")
-        
-        st.subheader("Streaming Output")
-        output_placeholder = st.empty()
-        output_placeholder.text_area("Output (streaming...)", "", height=220)
 
         if kind == "json":
             strings = collect_strings(content, [])
@@ -362,17 +371,21 @@ if st.button("Translate", type="primary"):
             unique.sort(key=len)
             done = {}
             accumulated_outputs = []
-            
+
             for i in range(0, len(unique), BATCH_SIZE):
                 batch = unique[i : i + BATCH_SIZE]
                 batch_results = translate_batch(batch, src, tgt)
                 for src_str, tgt_str in zip(batch, batch_results):
                     done[src_str] = tgt_str
                     accumulated_outputs.append(tgt_str)
-                
-                output_placeholder.text_area("Output (streaming...)", "\n".join(accumulated_outputs), height=220)
+
+                streamed = "\n".join(accumulated_outputs)
+                st.session_state["streamed_text"] = streamed
+                output_placeholder.text_area(
+                    "Output (streaming...)", streamed, height=220, key=f"stream_{i}"
+                )
                 bar.progress(min((i + BATCH_SIZE) / max(len(unique), 1), 1.0))
-                
+
             result_json = map_strings(content, lambda s: done.get(s, s))
             lines = [done.get(s, s) for s in strings]
             source_text = "\n".join(strings)
@@ -380,22 +393,32 @@ if st.button("Translate", type="primary"):
             src_lines = content.splitlines()
             pieces = [split_long(l.strip()) if l.strip() else [] for l in src_lines]
             flat = [p for chunks in pieces for p in chunks]
-            
+
             unique = list(dict.fromkeys(s for s in flat if s.strip()))
             unique.sort(key=len)
             done = {}
-            
+
             for i in range(0, len(unique), BATCH_SIZE):
                 batch = unique[i : i + BATCH_SIZE]
                 batch_results = translate_batch(batch, src, tgt)
                 for s_item, t_item in zip(batch, batch_results):
                     done[s_item] = t_item
-                
-                current_lines = [" ".join(done.get(p, p) for p in chunks) if chunks else "" for chunks in pieces]
-                output_placeholder.text_area("Output (streaming...)", "\n".join(current_lines), height=220)
+
+                current_lines = [
+                    " ".join(done.get(p, p) for p in chunks) if chunks else ""
+                    for chunks in pieces
+                ]
+                streamed = "\n".join(current_lines)
+                st.session_state["streamed_text"] = streamed
+                output_placeholder.text_area(
+                    "Output (streaming...)", streamed, height=220, key=f"stream_{i}"
+                )
                 bar.progress(min((i + BATCH_SIZE) / max(len(unique), 1), 1.0))
-                
-            lines = [" ".join(done.get(p, p) for p in chunks) if chunks else "" for chunks in pieces]
+
+            lines = [
+                " ".join(done.get(p, p) for p in chunks) if chunks else ""
+                for chunks in pieces
+            ]
             source_text = content
             result_json = {
                 "thread_id": st.session_state["thread_id"],
@@ -406,6 +429,7 @@ if st.button("Translate", type="primary"):
 
         bar.empty()
         st.session_state["result"] = {"lines": lines, "json": result_json}
+        st.session_state["streamed_text"] = "\n".join(lines)
 
         try:
             save_record(
@@ -419,12 +443,17 @@ if st.button("Translate", type="primary"):
         except Exception as e:
             st.warning(f"Translation done, but the record could not be saved: {e}")
 
+        st.rerun()
+
+# Downloads only (no extra text output)
 result = st.session_state.get("result")
 if result:
     st.markdown("**Download**")
     c1, c2, c3, c4 = st.columns(4)
     c1.download_button("PDF", make_pdf(result["lines"]), "translation.pdf", "application/pdf")
-    c2.download_button("TXT", "\n".join(result["lines"]).encode("utf-8"), "translation.txt", "text/plain")
+    c2.download_button(
+        "TXT", "\n".join(result["lines"]).encode("utf-8"), "translation.txt", "text/plain"
+    )
     c3.download_button(
         "DOCX",
         make_docx(result["lines"]),
@@ -438,7 +467,9 @@ if result:
         "application/json",
     )
     if not find_font():
-        st.caption("PDF note: no Unicode font found, so non-Latin text may show as '?'. See setup notes.")
+        st.caption(
+            "PDF note: no Unicode font found, so non-Latin text may show as '?'. See setup notes."
+        )
 
 # --------------------------------------------------------------------- history
 st.divider()
@@ -462,7 +493,10 @@ if not records:
     st.caption("No saved records yet.")
 for r in records:
     m = r["meta"]
-    title = f"{m.get('timestamp', '')}  ·  {m.get('source_name', '')}  ·  {m.get('source_lang', '')} → {m.get('target_lang', '')}  ·  {m.get('thread_id', '')}"
+    title = (
+        f"{m.get('timestamp', '')}  ·  {m.get('source_name', '')}  ·  "
+        f"{m.get('source_lang', '')} → {m.get('target_lang', '')}  ·  {m.get('thread_id', '')}"
+    )
     with st.expander(title):
         st.markdown("**Source (preview)**")
         st.text(m.get("source_preview", ""))
