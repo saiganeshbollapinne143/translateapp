@@ -224,33 +224,12 @@ def translate_batch(texts, src_code, tgt_code):
     return outputs
 
 
-def translate_many(strings, src_code, tgt_code, progress, placeholder=None):
-    """Translate a list of strings (batched, with de-duplication) and stream output."""
-    unique = list(dict.fromkeys(s for s in strings if s.strip()))
-    unique.sort(key=len)  # similar lengths per batch = less padding
-    done = {}
-    accumulated_outputs = []
-    
-    for i in range(0, len(unique), BATCH_SIZE):
-        batch = unique[i : i + BATCH_SIZE]
-        batch_results = translate_batch(batch, src_code, tgt_code)
-        for src, tgt in zip(batch, batch_results):
-            done[src] = tgt
-            accumulated_outputs.append(tgt)
-        
-        if placeholder is not None:
-            placeholder.text_area("Output (streaming...)", "\n".join(accumulated_outputs), height=220)
-            
-        progress.progress(min((i + BATCH_SIZE) / max(len(unique), 1), 1.0))
-    return done
-
-
 # ------------------------------------------------------------------- read files
 def split_long(line):
     """Split a long line into chunks of <= MAX_CHUNK_CHARS at sentence ends."""
     if len(line) <= MAX_CHUNK_CHARS:
         return [line]
-    sentences = re.split(r"(?<=[.!?।。؟])\s+", line)
+    sentences = re.split(r"(?<=[.!?।።؟])\s+", line)
     chunks, cur = [], ""
     for s in sentences:
         if cur and len(cur) + len(s) + 1 > MAX_CHUNK_CHARS:
@@ -344,7 +323,7 @@ def make_docx(lines):
 tcol1, tcol2 = st.columns([3, 1])
 tcol1.text_input("Thread ID (auto-generated)", value=st.session_state["thread_id"], disabled=True)
 tcol2.markdown("<div style='height:1.75rem'></div>", unsafe_allow_html=True)
-if tcol2.button("Clear output & New thread"):
+if tcol2.button("New thread"):
     st.session_state["thread_id"] = new_thread_id()
     st.session_state.pop("result", None)
     st.rerun()
@@ -362,7 +341,6 @@ if st.button("Translate", type="primary"):
     elif not uploaded and not typed.strip():
         st.warning("Upload a file or paste some text first.")
     else:
-        # Clear previous result explicitly before starting a new translation stream
         st.session_state.pop("result", None)
         
         try:
@@ -374,12 +352,27 @@ if st.button("Translate", type="primary"):
         src, tgt = LANGUAGES[src_name], LANGUAGES[tgt_name]
         bar = st.progress(0.0, text="Translating...")
         
+        st.subheader("Streaming Output File")
         output_placeholder = st.empty()
-        output_placeholder.text_area("Output", "", height=220)
+        output_placeholder.text_area("Output (streaming...)", "", height=220)
 
         if kind == "json":
             strings = collect_strings(content, [])
-            done = translate_many(strings, src, tgt, bar, placeholder=output_placeholder)
+            unique = list(dict.fromkeys(s for s in strings if s.strip()))
+            unique.sort(key=len)
+            done = {}
+            accumulated_outputs = []
+            
+            for i in range(0, len(unique), BATCH_SIZE):
+                batch = unique[i : i + BATCH_SIZE]
+                batch_results = translate_batch(batch, src, tgt)
+                for src_str, tgt_str in zip(batch, batch_results):
+                    done[src_str] = tgt_str
+                    accumulated_outputs.append(tgt_str)
+                
+                output_placeholder.text_area("Output (streaming...)", "\n".join(accumulated_outputs), height=220)
+                bar.progress(min((i + BATCH_SIZE) / max(len(unique), 1), 1.0))
+                
             result_json = map_strings(content, lambda s: done.get(s, s))
             lines = [done.get(s, s) for s in strings]
             source_text = "\n".join(strings)
@@ -388,11 +381,9 @@ if st.button("Translate", type="primary"):
             pieces = [split_long(l.strip()) if l.strip() else [] for l in src_lines]
             flat = [p for chunks in pieces for p in chunks]
             
-            # Custom streaming wrapper for line groups
             unique = list(dict.fromkeys(s for s in flat if s.strip()))
             unique.sort(key=len)
             done = {}
-            accumulated_lines = []
             
             for i in range(0, len(unique), BATCH_SIZE):
                 batch = unique[i : i + BATCH_SIZE]
@@ -400,9 +391,8 @@ if st.button("Translate", type="primary"):
                 for s_item, t_item in zip(batch, batch_results):
                     done[s_item] = t_item
                 
-                # Reconstruct current available lines for streaming preview
                 current_lines = [" ".join(done.get(p, p) for p in chunks) if chunks else "" for chunks in pieces]
-                output_placeholder.text_area("Output", "\n".join(current_lines), height=220)
+                output_placeholder.text_area("Output (streaming...)", "\n".join(current_lines), height=220)
                 bar.progress(min((i + BATCH_SIZE) / max(len(unique), 1), 1.0))
                 
             lines = [" ".join(done.get(p, p) for p in chunks) if chunks else "" for chunks in pieces]
@@ -417,7 +407,6 @@ if st.button("Translate", type="primary"):
         bar.empty()
         st.session_state["result"] = {"lines": lines, "json": result_json}
 
-        # save to ChromaDB
         try:
             save_record(
                 st.session_state["thread_id"],
@@ -432,10 +421,7 @@ if st.button("Translate", type="primary"):
 
 result = st.session_state.get("result")
 if result:
-    st.subheader("Translation")
-    st.text_area("Output", "\n".join(result["lines"]), height=220)
-
-    st.markdown("**Download**")
+    st.markdown("**Download Streaming Output File**")
     c1, c2, c3, c4 = st.columns(4)
     c1.download_button("PDF", make_pdf(result["lines"]), "translation.pdf", "application/pdf")
     c2.download_button("TXT", "\n".join(result["lines"]).encode("utf-8"), "translation.txt", "text/plain")
