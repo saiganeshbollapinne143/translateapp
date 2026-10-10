@@ -6,14 +6,20 @@ import re
 import uuid
 from datetime import datetime
 
-import chromadb
 import streamlit as st
 import torch
-from chromadb.config import Settings
 from docx import Document
 from fpdf import FPDF
 from pypdf import PdfReader
 from transformers import AutoTokenizer, AutoModelForSeq2SeqLM
+
+try:  # optional: saved to ChromaDB only when it is installed (e.g. locally)
+    import chromadb
+    from chromadb.config import Settings
+
+    HAS_CHROMA = True
+except ImportError:
+    HAS_CHROMA = False
 
 MODEL_NAME = "facebook/nllb-200-distilled-600M"
 MAX_CHUNK_CHARS = 400
@@ -101,7 +107,7 @@ def get_collection():
     return client.get_or_create_collection("translations")
 
 
-def save_record(thread_id, source_name, src_lang, tgt_lang, source_text, translated_text):
+def _chroma_save(thread_id, source_name, src_lang, tgt_lang, source_text, translated_text):
     col = get_collection()
     col.add(
         ids=[uuid.uuid4().hex],
@@ -120,7 +126,7 @@ def save_record(thread_id, source_name, src_lang, tgt_lang, source_text, transla
     )
 
 
-def load_records(thread_id=None, search=""):
+def _chroma_load(thread_id=None, search=""):
     col = get_collection()
     where = {"thread_id": thread_id} if thread_id else None
     if search.strip():
@@ -140,6 +146,44 @@ def load_records(thread_id=None, search=""):
     if not search.strip():
         records.sort(key=lambda r: r["meta"].get("timestamp", ""), reverse=True)
     return records[:50]
+
+
+def save_record(thread_id, source_name, src_lang, tgt_lang, source_text, translated_text):
+    if HAS_CHROMA:
+        return _chroma_save(
+            thread_id, source_name, src_lang, tgt_lang, source_text, translated_text
+        )
+    # Fallback (no ChromaDB installed): keep history for this browser session only
+    st.session_state.setdefault("history", []).append(
+        {
+            "id": uuid.uuid4().hex,
+            "doc": translated_text,
+            "meta": {
+                "thread_id": thread_id,
+                "timestamp": datetime.now().strftime("%Y-%m-%d %H:%M:%S"),
+                "source_name": source_name,
+                "source_lang": src_lang,
+                "target_lang": tgt_lang,
+                "source_preview": source_text[:500],
+                "chars": len(translated_text),
+            },
+        }
+    )
+
+
+def load_records(thread_id=None, search=""):
+    if HAS_CHROMA:
+        return _chroma_load(thread_id, search)
+    recs = st.session_state.get("history", [])
+    if thread_id:
+        recs = [r for r in recs if r["meta"]["thread_id"] == thread_id]
+    if search.strip():
+        q = search.strip().lower()
+        recs = [
+            r for r in recs
+            if q in r["doc"].lower() or q in r["meta"]["source_preview"].lower()
+        ]
+    return sorted(recs, key=lambda r: r["meta"]["timestamp"], reverse=True)[:50]
 
 
 # ----------------------------------------------------------------------- model
@@ -331,7 +375,7 @@ if st.button("Translate", type="primary"):
         bar.empty()
         st.session_state["result"] = {"lines": lines, "json": result_json}
 
-        # save to ChromaDB
+        # save the record (ChromaDB if installed, otherwise this session's memory)
         try:
             save_record(
                 st.session_state["thread_id"],
@@ -371,6 +415,8 @@ if result:
 # --------------------------------------------------------------------- history
 st.divider()
 st.subheader("Past records")
+if not HAS_CHROMA:
+    st.caption("History is kept for this browser session only.")
 
 h1, h2 = st.columns([1, 2])
 scope = h1.radio("Show", ["This thread", "All threads"], horizontal=True)

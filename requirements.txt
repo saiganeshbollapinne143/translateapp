@@ -6,4 +6,3 @@ sentencepiece
 pypdf
 python-docx
 fpdf2
-chromadb
