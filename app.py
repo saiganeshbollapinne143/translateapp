@@ -37,7 +37,7 @@ LANGUAGES = {
 torch.set_num_threads(2)
 
 # ---------------------------------------------------------------- page + style
-st.set_page_config(page_title="Document Translator", page_icon="🌍", layout="centered")
+st.set_page_config(page_title="AIT Global Technologies", page_icon="🌍", layout="centered")
 
 st.markdown(
     """
@@ -51,10 +51,12 @@ st.markdown(
         padding: 14px 22px; margin-bottom: 1.2rem;
     }
     .title-card h1 {
-        color: #FFFFFF !important; font-size: 1.25rem; font-weight: 600;
-        margin: 0; padding: 0; white-space: nowrap; overflow: hidden;
-        text-overflow: ellipsis;
+        color: #FFFFFF !important; font-size: 1.25rem; font-weight: 700;
+        letter-spacing: 0.5px; margin: 0; padding: 0; white-space: nowrap;
+        overflow: hidden; text-overflow: ellipsis;
     }
+    .title-card h1 .ait { color: #FFC107 !important; }
+    .title-card h1 .rest { color: #FFFFFF !important; }
 
     .stButton > button, .stDownloadButton > button,
     [data-testid="stFileUploader"] button {
@@ -68,7 +70,9 @@ st.markdown(
     }
     .stDownloadButton > button { width: 100%; }
     </style>
-    <div class="title-card"><h1>🌍 Document Translator &nbsp;·&nbsp; PDF, TXT, DOCX, JSON</h1></div>
+    <div class="title-card">
+        <h1><span class="ait">AIT</span> <span class="rest">GLOBAL TECHNOLOGIES</span></h1>
+    </div>
     """,
     unsafe_allow_html=True,
 )
