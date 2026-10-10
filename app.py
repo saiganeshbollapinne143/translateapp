@@ -1,6 +1,11 @@
-
-import glob, io, json, os, re, uuid
+import glob
+import io
+import json
+import os
+import re
+import uuid
 from datetime import datetime
+
 import ctranslate2
 import streamlit as st
 from docx import Document
@@ -8,132 +13,226 @@ from fpdf import FPDF
 from pypdf import PdfReader
 from huggingface_hub import snapshot_download
 from transformers import AutoTokenizer
-import chromadb
-from chromadb.config import Settings
 
-MODEL_NAME = "olob0/nllb-200-distilled-600M-ct2-int8_float16"
-BATCH_SIZE, MAX_CHUNK_CHARS = 4, 400
+try:  # optional: saved to ChromaDB only when it is installed (e.g. locally)
+    import chromadb
+    from chromadb.config import Settings
+
+    HAS_CHROMA = True
+except ImportError:
+    HAS_CHROMA = False
+
+MODEL_NAME = "olob0/nllb-200-distilled-600M-ct2-int8_float16"  # CTranslate2 int8, ~0.6 GB
+MAX_CHUNK_CHARS = 400
+BATCH_SIZE = 4
 CHROMA_PATH = os.path.join(os.path.dirname(os.path.abspath(__file__)), "chroma_db")
 
 LANGUAGES = {
-    "English":"eng_Latn", "Hindi":"hin_Deva", "Telugu":"tel_Telu",
-    "Tamil":"tam_Taml", "Kannada":"kan_Knda", "Malayalam":"mal_Mlym",
-    "Bengali":"ben_Beng", "Marathi":"mar_Deva", "Urdu":"urd_Arab",
-    "French":"fra_Latn", "German":"deu_Latn", "Spanish":"spa_Latn",
-    "Italian":"ita_Latn", "Arabic":"arb_Arab",
-    "Chinese (Simplified)":"zho_Hans", "Japanese":"jpn_Jpan"
+    "English": "eng_Latn",
+    "Hindi": "hin_Deva",
+    "Telugu": "tel_Telu",
+    "Tamil": "tam_Taml",
+    "Kannada": "kan_Knda",
+    "Malayalam": "mal_Mlym",
+    "Bengali": "ben_Beng",
+    "Marathi": "mar_Deva",
+    "Urdu": "urd_Arab",
+    "French": "fra_Latn",
+    "German": "deu_Latn",
+    "Spanish": "spa_Latn",
+    "Italian": "ita_Latn",
+    "Arabic": "arb_Arab",
+    "Chinese (Simplified)": "zho_Hans",
+    "Japanese": "jpn_Jpan",
 }
 
+# ---------------------------------------------------------------- page + style
 st.set_page_config(page_title="AIT Global Technologies", page_icon="🌍", layout="centered")
-st.markdown("""
-<style>
-.stApp,[data-testid="stHeader"]{background:#fff}
-.stApp p,.stApp label,.stApp span,.stApp li{color:#1b1b1b}
-.block-container{padding-top:2rem!important;max-width:820px}
-.title-card{background:#0b2a5b;border-radius:12px;padding:18px 12px;
-text-align:center;margin-bottom:20px}
-.title-card h1{font-size:clamp(18px,4vw,26px);margin:0;white-space:normal}
-.ait{color:#ffc107!important}.rest{color:white!important}
-.stButton>button,.stDownloadButton>button{
-background:#ffc107!important;color:#1b1b1b!important;
-border:0!important;border-radius:8px!important;font-weight:600!important}
-.stDownloadButton>button{width:100%}
-</style>
-<div class="title-card"><h1><span class="ait">AIT</span>
-<span class="rest"> GLOBAL TECHNOLOGIES</span></h1></div>
-""", unsafe_allow_html=True)
 
+st.markdown(
+    """
+    <style>
+    .stApp, [data-testid="stHeader"] { background: #FFFFFF; }
+    .stApp, .stApp p, .stApp label, .stApp span, .stApp li { color: #1B1B1B; }
+    .block-container { padding-top: 4.5rem !important; max-width: 820px; }
+
+    .title-card {
+        background: #0B2A5B; border-radius: 12px;
+        padding: 14px 22px; margin-bottom: 1.2rem;
+    }
+    .title-card h1 {
+        color: #FFFFFF !important; font-size: 1.25rem; font-weight: 700;
+        letter-spacing: 0.5px; margin: 0; padding: 0; white-space: nowrap;
+        overflow: hidden; text-overflow: ellipsis;
+    }
+    .title-card h1 .ait { color: #FFC107 !important; }
+    .title-card h1 .rest { color: #FFFFFF !important; }
+
+    .stButton > button, .stDownloadButton > button,
+    [data-testid="stFileUploader"] button {
+        background: #FFC107 !important; color: #1B1B1B !important;
+        border: none !important; border-radius: 8px !important;
+        font-weight: 600 !important;
+    }
+    .stButton > button:hover, .stDownloadButton > button:hover,
+    [data-testid="stFileUploader"] button:hover {
+        background: #FFB300 !important; color: #000000 !important;
+    }
+    .stDownloadButton > button { width: 100%; }
+    </style>
+    <div class="title-card">
+        <h1><span class="ait">AIT</span> <span class="rest">GLOBAL TECHNOLOGIES</span></h1>
+    </div>
+    """,
+    unsafe_allow_html=True,
+)
+
+
+# --------------------------------------------------------------------- thread
 def new_thread_id():
     return "THR-" + uuid.uuid4().hex[:8].upper()
 
-if "thread_id" not in st.session_state:
-    st.session_state.thread_id = new_thread_id()
 
+if "thread_id" not in st.session_state:
+    st.session_state["thread_id"] = new_thread_id()  # generated automatically
+
+
+# -------------------------------------------------------------------- chromadb
 @st.cache_resource
 def get_collection():
     client = chromadb.PersistentClient(
-        path=CHROMA_PATH,
-        settings=Settings(anonymized_telemetry=False)
+        path=CHROMA_PATH, settings=Settings(anonymized_telemetry=False)
     )
     return client.get_or_create_collection("translations")
 
-def save_record(thread, filename, src, tgt, source, translated):
-    get_collection().add(
+
+def _chroma_save(thread_id, source_name, src_lang, tgt_lang, source_text, translated_text):
+    col = get_collection()
+    col.add(
         ids=[uuid.uuid4().hex],
-        documents=[translated],
-        metadatas=[{
-            "thread_id":thread,
-            "timestamp":datetime.now().strftime("%Y-%m-%d %H:%M:%S"),
-            "source_name":filename,
-            "source_lang":src,
-            "target_lang":tgt,
-            "source_preview":source[:500],
-            "chars":len(translated)
-        }]
+        documents=[translated_text],
+        metadatas=[
+            {
+                "thread_id": thread_id,
+                "timestamp": datetime.now().strftime("%Y-%m-%d %H:%M:%S"),
+                "source_name": source_name,
+                "source_lang": src_lang,
+                "target_lang": tgt_lang,
+                "source_preview": source_text[:500],
+                "chars": len(translated_text),
+            }
+        ],
     )
 
-def load_records(thread=None, search=""):
+
+def _chroma_load(thread_id=None, search=""):
     col = get_collection()
-    where = {"thread_id":thread} if thread else None
-    if search.strip() and col.count():
+    where = {"thread_id": thread_id} if thread_id else None
+    if search.strip():
+        total = col.count()
+        if total == 0:
+            return []
         res = col.query(
             query_texts=[search.strip()],
-            n_results=min(20, col.count()),
-            where=where
+            n_results=min(20, total),
+            where=where,
         )
-        records = [
-            {"doc":d,"meta":m}
-            for d,m in zip(res["documents"][0],res["metadatas"][0])
-        ]
+        ids, docs, metas = res["ids"][0], res["documents"][0], res["metadatas"][0]
     else:
-        res = col.get(where=where, include=["documents","metadatas"])
-        records = [
-            {"doc":d,"meta":m}
-            for d,m in zip(res["documents"],res["metadatas"])
-        ]
-        if search.strip():
-            q = search.lower()
-            records = [r for r in records if q in r["doc"].lower()
-                       or q in r["meta"].get("source_preview","").lower()]
-    return sorted(records,key=lambda r:r["meta"].get("timestamp",""),reverse=True)[:50]
+        res = col.get(where=where)
+        ids, docs, metas = res["ids"], res["documents"], res["metadatas"]
+    records = [{"id": i, "doc": d, "meta": m} for i, d, m in zip(ids, docs, metas)]
+    if not search.strip():
+        records.sort(key=lambda r: r["meta"].get("timestamp", ""), reverse=True)
+    return records[:50]
 
-@st.cache_resource(show_spinner="Loading translation model...")
+
+def save_record(thread_id, source_name, src_lang, tgt_lang, source_text, translated_text):
+    if HAS_CHROMA:
+        return _chroma_save(
+            thread_id, source_name, src_lang, tgt_lang, source_text, translated_text
+        )
+    # Fallback (no ChromaDB installed): keep history for this browser session only
+    st.session_state.setdefault("history", []).append(
+        {
+            "id": uuid.uuid4().hex,
+            "doc": translated_text,
+            "meta": {
+                "thread_id": thread_id,
+                "timestamp": datetime.now().strftime("%Y-%m-%d %H:%M:%S"),
+                "source_name": source_name,
+                "source_lang": src_lang,
+                "target_lang": tgt_lang,
+                "source_preview": source_text[:500],
+                "chars": len(translated_text),
+            },
+        }
+    )
+
+
+def load_records(thread_id=None, search=""):
+    if HAS_CHROMA:
+        return _chroma_load(thread_id, search)
+    recs = st.session_state.get("history", [])
+    if thread_id:
+        recs = [r for r in recs if r["meta"]["thread_id"] == thread_id]
+    if search.strip():
+        q = search.strip().lower()
+        recs = [
+            r for r in recs
+            if q in r["doc"].lower() or q in r["meta"]["source_preview"].lower()
+        ]
+    return sorted(recs, key=lambda r: r["meta"]["timestamp"], reverse=True)[:50]
+
+
+# ----------------------------------------------------------------------- model
+@st.cache_resource(show_spinner="Loading model (first run only)...")
 def load_model():
     path = snapshot_download(MODEL_NAME)
-    tok = AutoTokenizer.from_pretrained(path)
-    model = ctranslate2.Translator(
-        path,device="cpu",compute_type="int8",
-        inter_threads=1,intra_threads=2
+    tokenizer = AutoTokenizer.from_pretrained(path)
+    translator = ctranslate2.Translator(
+        path, device="cpu", compute_type="int8", inter_threads=1, intra_threads=2
     )
-    return tok,model
+    return tokenizer, translator
 
-def translate_batch(texts,src,tgt):
-    tok,model = load_model()
-    tok.src_lang = src
-    batch = [tok.convert_ids_to_tokens(
-        tok(text,truncation=True,max_length=256).input_ids
-    ) for text in texts]
-    results = model.translate_batch(
-        batch,target_prefix=[[tgt]]*len(batch),
-        beam_size=2,max_decoding_length=300
+
+def translate_batch(texts, src_code, tgt_code):
+    tokenizer, translator = load_model()
+    tokenizer.src_lang = src_code
+    batch = [
+        tokenizer.convert_ids_to_tokens(
+            tokenizer(t, truncation=True, max_length=256).input_ids
+        )
+        for t in texts
+    ]
+    results = translator.translate_batch(
+        batch,
+        target_prefix=[[tgt_code]] * len(batch),
+        beam_size=2,
+        max_decoding_length=300,
     )
-    output = []
+    outputs = []
     for r in results:
         tokens = r.hypotheses[0]
-        if tokens and tokens[0] == tgt:
-            tokens = tokens[1:]
-        output.append(tok.decode(
-            tok.convert_tokens_to_ids(tokens),skip_special_tokens=True
-        ))
-    return output
+        if tokens and tokens[0] == tgt_code:
+            tokens = tokens[1:]  # drop the language-code token
+        outputs.append(
+            tokenizer.decode(
+                tokenizer.convert_tokens_to_ids(tokens), skip_special_tokens=True
+            )
+        )
+    return outputs
 
+
+# ------------------------------------------------------------------- read files
 def split_long(line):
+    """Split a long line into chunks of <= MAX_CHUNK_CHARS at sentence ends."""
     if len(line) <= MAX_CHUNK_CHARS:
         return [line]
-    sentences = re.split(r"(?<=[.!?।።؟])\s+",line)
-    chunks,cur = [],""
+    sentences = re.split(r"(?<=[.!?।።؟])\s+", line)
+    chunks, cur = [], ""
     for s in sentences:
-        if cur and len(cur)+len(s)+1 > MAX_CHUNK_CHARS:
+        if cur and len(cur) + len(s) + 1 > MAX_CHUNK_CHARS:
             chunks.append(cur)
             cur = s
         else:
@@ -142,58 +241,74 @@ def split_long(line):
         chunks.append(cur)
     return chunks
 
-def read_upload(f):
-    data,name = f.getvalue(),f.name.lower()
-    if name.endswith(".pdf"):
-        return "txt","\n\n".join(p.extract_text() or "" for p in PdfReader(io.BytesIO(data)).pages)
-    if name.endswith(".docx"):
-        return "txt","\n".join(p.text for p in Document(io.BytesIO(data)).paragraphs)
-    if name.endswith(".json"):
-        return "json",json.loads(data.decode("utf-8",errors="replace"))
-    return "txt",data.decode("utf-8",errors="replace")
 
-def map_strings(obj,fn):
-    if isinstance(obj,str):
+def read_upload(uploaded):
+    name = uploaded.name.lower()
+    data = uploaded.getvalue()
+    if name.endswith(".pdf"):
+        reader = PdfReader(io.BytesIO(data))
+        return "txt", "\n\n".join((p.extract_text() or "") for p in reader.pages)
+    if name.endswith(".docx"):
+        doc = Document(io.BytesIO(data))
+        return "txt", "\n".join(p.text for p in doc.paragraphs)
+    if name.endswith(".json"):
+        return "json", json.loads(data.decode("utf-8", errors="replace"))
+    return "txt", data.decode("utf-8", errors="replace")
+
+
+def map_strings(obj, fn):
+    """Apply fn to every string VALUE in a JSON structure (keys untouched)."""
+    if isinstance(obj, str):
         return fn(obj)
-    if isinstance(obj,list):
-        return [map_strings(x,fn) for x in obj]
-    if isinstance(obj,dict):
-        return {k:map_strings(v,fn) for k,v in obj.items()}
+    if isinstance(obj, list):
+        return [map_strings(x, fn) for x in obj]
+    if isinstance(obj, dict):
+        return {k: map_strings(v, fn) for k, v in obj.items()}
     return obj
 
-def collect_strings(obj,acc):
-    map_strings(obj,lambda s:acc.append(s) or s)
+
+def collect_strings(obj, acc):
+    map_strings(obj, lambda s: acc.append(s) or s)
     return acc
 
+
+# ----------------------------------------------------------------- build files
 def find_font():
-    for pattern in [
-        "font.ttf","/usr/share/fonts/truetype/dejavu/DejaVuSans.ttf",
+    if os.path.exists("font.ttf"):
+        return "font.ttf"
+    patterns = [
         "/usr/share/fonts/truetype/noto/NotoSans-Regular.ttf",
-        "C:/Windows/Fonts/arial.ttf","C:/Windows/Fonts/Nirmala.ttf"
-    ]:
-        hits = glob.glob(pattern)
+        "/usr/share/fonts/truetype/noto/NotoSans*-Regular.ttf",
+        "/usr/share/fonts/truetype/dejavu/DejaVuSans.ttf",
+        "C:/Windows/Fonts/arial.ttf",
+        "C:/Windows/Fonts/Nirmala.ttf",
+    ]
+    for p in patterns:
+        hits = glob.glob(p)
         if hits:
             return hits[0]
     return None
 
+
 def make_pdf(lines):
     pdf = FPDF()
-    pdf.set_auto_page_break(auto=True,margin=15)
+    pdf.set_auto_page_break(auto=True, margin=15)
     pdf.add_page()
     font = find_font()
     if font:
-        pdf.add_font("U","",font)
-        pdf.set_font("U",size=11)
+        pdf.add_font("U", "", font)
+        pdf.set_font("U", size=11)
     else:
-        pdf.set_font("Helvetica",size=11)
+        pdf.set_font("Helvetica", size=11)
     for line in lines:
         if not line.strip():
             pdf.ln(5)
-        else:
-            if not font:
-                line = line.encode("latin-1","replace").decode("latin-1")
-            pdf.multi_cell(0,6,line)
+            continue
+        if not font:
+            line = line.encode("latin-1", "replace").decode("latin-1")
+        pdf.multi_cell(0, 6, line, new_x="LMARGIN", new_y="NEXT")
     return bytes(pdf.output())
+
 
 def make_docx(lines):
     doc = Document()
@@ -203,122 +318,153 @@ def make_docx(lines):
     doc.save(buf)
     return buf.getvalue()
 
-# ----------------------------- INPUTS
-a,b = st.columns([3,1])
-a.text_input("System-generated Thread ID",st.session_state.thread_id,disabled=True)
-if b.button("New thread"):
-    st.session_state.thread_id = new_thread_id()
-    st.session_state.pop("result",None)
+
+# -------------------------------------------------------------------------- UI
+tcol1, tcol2 = st.columns([3, 1])
+tcol1.text_input("Thread ID (auto-generated)", value=st.session_state["thread_id"], disabled=True)
+tcol2.markdown("<div style='height:1.75rem'></div>", unsafe_allow_html=True)
+if tcol2.button("New thread"):
+    st.session_state["thread_id"] = new_thread_id()
+    st.session_state.pop("result", None)
     st.rerun()
 
-c1,c2 = st.columns(2)
-src_name = c1.selectbox("Translate from",list(LANGUAGES),index=0)
-tgt_name = c2.selectbox("Translate to",list(LANGUAGES),index=1)
-uploaded = st.file_uploader("Upload file",type=["pdf","docx","txt","json"])
-typed = st.text_area("Or paste text",height=100)
+col1, col2 = st.columns(2)
+src_name = col1.selectbox("Translate from", list(LANGUAGES), index=0)
+tgt_name = col2.selectbox("Translate to", list(LANGUAGES), index=1)
 
-# ----------------------------- STREAM TRANSLATION OUTPUT ONLY
-if st.button("Translate",type="primary",use_container_width=True):
+uploaded = st.file_uploader("Upload a file", type=["pdf", "txt", "docx", "json"])
+typed = st.text_area("...or paste text", height=120)
+
+if st.button("Translate", type="primary"):
     if src_name == tgt_name:
-        st.warning("Choose different source and target languages.")
+        st.info("Source and target languages are the same.")
     elif not uploaded and not typed.strip():
-        st.warning("Upload a file or paste text first.")
+        st.warning("Upload a file or paste some text first.")
     else:
+        st.session_state.pop("result", None)
+        
         try:
-            kind,content = read_upload(uploaded) if uploaded else ("txt",typed)
-            source_text = json.dumps(content,ensure_ascii=False) if kind=="json" else content
-            src,tgt = LANGUAGES[src_name],LANGUAGES[tgt_name]
-            st.subheader("Translated Output")
-            output_box = st.empty()
-            progress = st.progress(0.0)
-            done = {}
-
-            if kind == "json":
-                strings = collect_strings(content,[])
-                unique = list(dict.fromkeys(s for s in strings if s.strip()))
-                total = max(len(unique),1)
-                for i in range(0,len(unique),BATCH_SIZE):
-                    batch = unique[i:i+BATCH_SIZE]
-                    done.update(zip(batch,translate_batch(batch,src,tgt)))
-                    partial = map_strings(content,lambda s:done.get(s,s))
-                    shown = json.dumps(partial,ensure_ascii=False,indent=2)
-                    output_box.code(shown,language="json")
-                    progress.progress(min((i+len(batch))/total,1.0))
-                final_json = map_strings(content,lambda s:done.get(s,s))
-                translated_text = json.dumps(final_json,ensure_ascii=False,indent=2)
-                lines = translated_text.splitlines()
-                result_json = final_json
-            else:
-                original_lines = content.splitlines()
-                pieces = [split_long(x.strip()) if x.strip() else [] for x in original_lines]
-                unique = list(dict.fromkeys(p for group in pieces for p in group if p.strip()))
-                total = max(len(unique),1)
-                for i in range(0,len(unique),BATCH_SIZE):
-                    batch = unique[i:i+BATCH_SIZE]
-                    done.update(zip(batch,translate_batch(batch,src,tgt)))
-                    lines = [
-                        " ".join(done.get(p,p) for p in group) if group else ""
-                        for group in pieces
-                    ]
-                    # Only translated text is shown while batches finish
-                    output_box.text_area("Translation","\n".join(lines),height=250)
-                    progress.progress(min((i+len(batch))/total,1.0))
-                translated_text = "\n".join(lines)
-                result_json = {
-                    "thread_id":st.session_state.thread_id,
-                    "source_language":src_name,
-                    "target_language":tgt_name,
-                    "translated_text":translated_text
-                }
-
-            progress.empty()
-            st.session_state.result = {"lines":lines,"json":result_json}
-            save_record(
-                st.session_state.thread_id,
-                uploaded.name if uploaded else "pasted text",
-                src_name,tgt_name,source_text,translated_text
-            )
-            st.success("Translation completed and history saved.")
+            kind, content = read_upload(uploaded) if uploaded else ("txt", typed)
         except Exception as e:
-            st.error(f"Translation failed: {e}")
+            st.error(f"Could not read the file: {e}")
+            st.stop()
 
-# ----------------------------- DOWNLOADS
+        src, tgt = LANGUAGES[src_name], LANGUAGES[tgt_name]
+        bar = st.progress(0.0, text="Translating...")
+        
+        st.subheader("Streaming Output")
+        output_placeholder = st.empty()
+        output_placeholder.text_area("Output (streaming...)", "", height=220)
+
+        if kind == "json":
+            strings = collect_strings(content, [])
+            unique = list(dict.fromkeys(s for s in strings if s.strip()))
+            unique.sort(key=len)
+            done = {}
+            accumulated_outputs = []
+            
+            for i in range(0, len(unique), BATCH_SIZE):
+                batch = unique[i : i + BATCH_SIZE]
+                batch_results = translate_batch(batch, src, tgt)
+                for src_str, tgt_str in zip(batch, batch_results):
+                    done[src_str] = tgt_str
+                    accumulated_outputs.append(tgt_str)
+                
+                output_placeholder.text_area("Output (streaming...)", "\n".join(accumulated_outputs), height=220)
+                bar.progress(min((i + BATCH_SIZE) / max(len(unique), 1), 1.0))
+                
+            result_json = map_strings(content, lambda s: done.get(s, s))
+            lines = [done.get(s, s) for s in strings]
+            source_text = "\n".join(strings)
+        else:
+            src_lines = content.splitlines()
+            pieces = [split_long(l.strip()) if l.strip() else [] for l in src_lines]
+            flat = [p for chunks in pieces for p in chunks]
+            
+            unique = list(dict.fromkeys(s for s in flat if s.strip()))
+            unique.sort(key=len)
+            done = {}
+            
+            for i in range(0, len(unique), BATCH_SIZE):
+                batch = unique[i : i + BATCH_SIZE]
+                batch_results = translate_batch(batch, src, tgt)
+                for s_item, t_item in zip(batch, batch_results):
+                    done[s_item] = t_item
+                
+                current_lines = [" ".join(done.get(p, p) for p in chunks) if chunks else "" for chunks in pieces]
+                output_placeholder.text_area("Output (streaming...)", "\n".join(current_lines), height=220)
+                bar.progress(min((i + BATCH_SIZE) / max(len(unique), 1), 1.0))
+                
+            lines = [" ".join(done.get(p, p) for p in chunks) if chunks else "" for chunks in pieces]
+            source_text = content
+            result_json = {
+                "thread_id": st.session_state["thread_id"],
+                "source_language": src_name,
+                "target_language": tgt_name,
+                "translated_text": "\n".join(lines),
+            }
+
+        bar.empty()
+        st.session_state["result"] = {"lines": lines, "json": result_json}
+
+        try:
+            save_record(
+                st.session_state["thread_id"],
+                uploaded.name if uploaded else "pasted text",
+                src_name,
+                tgt_name,
+                source_text,
+                "\n".join(lines),
+            )
+        except Exception as e:
+            st.warning(f"Translation done, but the record could not be saved: {e}")
+
 result = st.session_state.get("result")
 if result:
-    st.markdown("**Download translation**")
-    c1,c2,c3,c4 = st.columns(4)
-    c1.download_button("PDF",make_pdf(result["lines"]),"translation.pdf","application/pdf")
-    c2.download_button("TXT","\n".join(result["lines"]),"translation.txt","text/plain")
+    st.markdown("**Download**")
+    c1, c2, c3, c4 = st.columns(4)
+    c1.download_button("PDF", make_pdf(result["lines"]), "translation.pdf", "application/pdf")
+    c2.download_button("TXT", "\n".join(result["lines"]).encode("utf-8"), "translation.txt", "text/plain")
     c3.download_button(
-        "DOCX",make_docx(result["lines"]),"translation.docx",
-        "application/vnd.openxmlformats-officedocument.wordprocessingml.document"
+        "DOCX",
+        make_docx(result["lines"]),
+        "translation.docx",
+        "application/vnd.openxmlformats-officedocument.wordprocessingml.document",
     )
     c4.download_button(
-        "JSON",json.dumps(result["json"],ensure_ascii=False,indent=2),
-        "translation.json","application/json"
+        "JSON",
+        json.dumps(result["json"], ensure_ascii=False, indent=2).encode("utf-8"),
+        "translation.json",
+        "application/json",
     )
     if not find_font():
-        st.caption("No Unicode font found: non-Latin characters in PDF may display incorrectly.")
+        st.caption("PDF note: no Unicode font found, so non-Latin text may show as '?'. See setup notes.")
 
-# ----------------------------- CHROMADB HISTORY
+# --------------------------------------------------------------------- history
 st.divider()
-st.subheader("Past Translation History")
-h1,h2 = st.columns([1,2])
-scope = h1.radio("Show",["This thread","All threads"],horizontal=True)
-search = h2.text_input("Search history",placeholder="Search translated text")
+st.subheader("Past records")
+if not HAS_CHROMA:
+    st.caption("History is kept for this browser session only.")
+
+h1, h2 = st.columns([1, 2])
+scope = h1.radio("Show", ["This thread", "All threads"], horizontal=True)
+search = h2.text_input("Search past translations", placeholder="Type a word or topic...")
+
 try:
     records = load_records(
-        st.session_state.thread_id if scope=="This thread" else None,search
+        st.session_state["thread_id"] if scope == "This thread" else None, search
     )
-    if not records:
-        st.caption("No saved records yet.")
-    for r in records:
-        m = r["meta"]
-        title = f'{m.get("timestamp","")} · {m.get("source_name","")} · {m.get("source_lang","")} → {m.get("target_lang","")} · {m.get("thread_id","")}'
-        with st.expander(title):
-            st.caption("Source preview")
-            st.text(m.get("source_preview",""))
-            st.caption("Saved translation")
-            st.text(r["doc"])
 except Exception as e:
-    st.warning(f"Could not load ChromaDB history: {e}")
+    records = []
+    st.warning(f"Could not load records: {e}")
+
+if not records:
+    st.caption("No saved records yet.")
+for r in records:
+    m = r["meta"]
+    title = f"{m.get('timestamp', '')}  ·  {m.get('source_name', '')}  ·  {m.get('source_lang', '')} → {m.get('target_lang', '')}  ·  {m.get('thread_id', '')}"
+    with st.expander(title):
+        st.markdown("**Source (preview)**")
+        st.text(m.get("source_preview", ""))
+        st.markdown("**Translation**")
+        st.text(r["doc"])
