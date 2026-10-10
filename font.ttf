@@ -1,0 +1,56 @@
+def find_font():
+    candidates = [
+        "font.ttf",  # ← put a TTF file next to app.py (best solution)
+        "/usr/share/fonts/truetype/noto/NotoSans-Regular.ttf",
+        "/usr/share/fonts/truetype/dejavu/DejaVuSans.ttf",
+        "C:/Windows/Fonts/Nirmala.ttf",
+        "C:/Windows/Fonts/arial.ttf",
+    ]
+    for p in candidates:
+        hits = glob.glob(p)
+        if hits and os.path.exists(hits[0]):
+            return hits[0]
+    return None
+
+
+def make_pdf(lines):
+    pdf = FPDF()
+    pdf.set_auto_page_break(auto=True, margin=15)
+    pdf.add_page()
+
+    font_path = find_font()
+    use_unicode = False
+
+    if font_path:
+        try:
+            pdf.add_font("Unicode", "", font_path)
+            pdf.set_font("Unicode", size=11)
+            use_unicode = True
+        except Exception:
+            use_unicode = False
+
+    if not use_unicode:
+        pdf.set_font("Helvetica", size=11)
+        # Convert every line to a safe version so Helvetica never crashes
+        safe_lines = []
+        for line in lines:
+            try:
+                # Keep only characters Helvetica can handle
+                safe = line.encode("latin-1", "replace").decode("latin-1")
+            except Exception:
+                safe = "".join(c if ord(c) < 256 else "?" for c in line)
+            safe_lines.append(safe)
+        lines = safe_lines
+
+    for line in lines:
+        if not line.strip():
+            pdf.ln(5)
+            continue
+        try:
+            pdf.multi_cell(0, 6, line, new_x="LMARGIN", new_y="NEXT")
+        except Exception:
+            # Final safety net
+            safe = "".join(c if ord(c) < 256 else "?" for c in line)
+            pdf.multi_cell(0, 6, safe, new_x="LMARGIN", new_y="NEXT")
+
+    return bytes(pdf.output())
