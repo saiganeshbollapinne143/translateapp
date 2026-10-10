@@ -6,12 +6,13 @@ import re
 import uuid
 from datetime import datetime
 
+import ctranslate2
 import streamlit as st
-import torch
 from docx import Document
 from fpdf import FPDF
 from pypdf import PdfReader
-from transformers import AutoTokenizer, AutoModelForSeq2SeqLM
+from huggingface_hub import snapshot_download
+from transformers import AutoTokenizer
 
 try:  # optional: saved to ChromaDB only when it is installed (e.g. locally)
     import chromadb
@@ -21,7 +22,7 @@ try:  # optional: saved to ChromaDB only when it is installed (e.g. locally)
 except ImportError:
     HAS_CHROMA = False
 
-MODEL_NAME = "facebook/nllb-200-distilled-600M"
+MODEL_NAME = "olob0/nllb-200-distilled-600M-ct2-int8_float16"  # CTranslate2 int8, ~0.6 GB
 MAX_CHUNK_CHARS = 400
 BATCH_SIZE = 4
 CHROMA_PATH = os.path.join(os.path.dirname(os.path.abspath(__file__)), "chroma_db")
@@ -44,8 +45,6 @@ LANGUAGES = {
     "Chinese (Simplified)": "zho_Hans",
     "Japanese": "jpn_Jpan",
 }
-
-torch.set_num_threads(2)
 
 # ---------------------------------------------------------------- page + style
 st.set_page_config(page_title="AIT Global Technologies", page_icon="🌍", layout="centered")
@@ -189,28 +188,40 @@ def load_records(thread_id=None, search=""):
 # ----------------------------------------------------------------------- model
 @st.cache_resource(show_spinner="Loading model (first run only)...")
 def load_model():
-    tokenizer = AutoTokenizer.from_pretrained(MODEL_NAME)
-    model = AutoModelForSeq2SeqLM.from_pretrained(
-        MODEL_NAME, torch_dtype=torch.bfloat16, low_cpu_mem_usage=True
+    path = snapshot_download(MODEL_NAME)
+    tokenizer = AutoTokenizer.from_pretrained(path)
+    translator = ctranslate2.Translator(
+        path, device="cpu", compute_type="int8", inter_threads=1, intra_threads=2
     )
-    model.eval()
-    return tokenizer, model
+    return tokenizer, translator
 
 
 def translate_batch(texts, src_code, tgt_code):
-    tokenizer, model = load_model()
+    tokenizer, translator = load_model()
     tokenizer.src_lang = src_code
-    inputs = tokenizer(
-        texts, return_tensors="pt", padding=True, truncation=True, max_length=256
-    )
-    with torch.inference_mode():
-        out = model.generate(
-            **inputs,
-            forced_bos_token_id=tokenizer.convert_tokens_to_ids(tgt_code),
-            max_new_tokens=300,
-            num_beams=2,
+    batch = [
+        tokenizer.convert_ids_to_tokens(
+            tokenizer(t, truncation=True, max_length=256).input_ids
         )
-    return tokenizer.batch_decode(out, skip_special_tokens=True)
+        for t in texts
+    ]
+    results = translator.translate_batch(
+        batch,
+        target_prefix=[[tgt_code]] * len(batch),
+        beam_size=2,
+        max_decoding_length=300,
+    )
+    outputs = []
+    for r in results:
+        tokens = r.hypotheses[0]
+        if tokens and tokens[0] == tgt_code:
+            tokens = tokens[1:]  # drop the language-code token
+        outputs.append(
+            tokenizer.decode(
+                tokenizer.convert_tokens_to_ids(tokens), skip_special_tokens=True
+            )
+        )
+    return outputs
 
 
 def translate_many(strings, src_code, tgt_code, progress):
@@ -375,7 +386,7 @@ if st.button("Translate", type="primary"):
         bar.empty()
         st.session_state["result"] = {"lines": lines, "json": result_json}
 
-        # save the record (ChromaDB if installed, otherwise this session's memory)
+        # save to ChromaDB
         try:
             save_record(
                 st.session_state["thread_id"],
