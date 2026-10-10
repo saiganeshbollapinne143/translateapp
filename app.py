@@ -224,15 +224,23 @@ def translate_batch(texts, src_code, tgt_code):
     return outputs
 
 
-def translate_many(strings, src_code, tgt_code, progress):
-    """Translate a list of strings (batched, with de-duplication)."""
+def translate_many(strings, src_code, tgt_code, progress, placeholder=None):
+    """Translate a list of strings (batched, with de-duplication) and stream output."""
     unique = list(dict.fromkeys(s for s in strings if s.strip()))
     unique.sort(key=len)  # similar lengths per batch = less padding
     done = {}
+    accumulated_outputs = []
+    
     for i in range(0, len(unique), BATCH_SIZE):
         batch = unique[i : i + BATCH_SIZE]
-        for src, tgt in zip(batch, translate_batch(batch, src_code, tgt_code)):
+        batch_results = translate_batch(batch, src_code, tgt_code)
+        for src, tgt in zip(batch, batch_results):
             done[src] = tgt
+            accumulated_outputs.append(tgt)
+        
+        if placeholder is not None:
+            placeholder.text_area("Output (streaming...)", "\n".join(accumulated_outputs), height=220)
+            
         progress.progress(min((i + BATCH_SIZE) / max(len(unique), 1), 1.0))
     return done
 
@@ -336,7 +344,7 @@ def make_docx(lines):
 tcol1, tcol2 = st.columns([3, 1])
 tcol1.text_input("Thread ID (auto-generated)", value=st.session_state["thread_id"], disabled=True)
 tcol2.markdown("<div style='height:1.75rem'></div>", unsafe_allow_html=True)
-if tcol2.button("New thread"):
+if tcol2.button("Clear output & New thread"):
     st.session_state["thread_id"] = new_thread_id()
     st.session_state.pop("result", None)
     st.rerun()
@@ -354,6 +362,9 @@ if st.button("Translate", type="primary"):
     elif not uploaded and not typed.strip():
         st.warning("Upload a file or paste some text first.")
     else:
+        # Clear previous result explicitly before starting a new translation stream
+        st.session_state.pop("result", None)
+        
         try:
             kind, content = read_upload(uploaded) if uploaded else ("txt", typed)
         except Exception as e:
@@ -362,10 +373,13 @@ if st.button("Translate", type="primary"):
 
         src, tgt = LANGUAGES[src_name], LANGUAGES[tgt_name]
         bar = st.progress(0.0, text="Translating...")
+        
+        output_placeholder = st.empty()
+        output_placeholder.text_area("Output", "", height=220)
 
         if kind == "json":
             strings = collect_strings(content, [])
-            done = translate_many(strings, src, tgt, bar)
+            done = translate_many(strings, src, tgt, bar, placeholder=output_placeholder)
             result_json = map_strings(content, lambda s: done.get(s, s))
             lines = [done.get(s, s) for s in strings]
             source_text = "\n".join(strings)
@@ -373,8 +387,25 @@ if st.button("Translate", type="primary"):
             src_lines = content.splitlines()
             pieces = [split_long(l.strip()) if l.strip() else [] for l in src_lines]
             flat = [p for chunks in pieces for p in chunks]
-            done = translate_many(flat, src, tgt, bar)
-            lines = [" ".join(done.get(p, p) for p in chunks) for chunks in pieces]
+            
+            # Custom streaming wrapper for line groups
+            unique = list(dict.fromkeys(s for s in flat if s.strip()))
+            unique.sort(key=len)
+            done = {}
+            accumulated_lines = []
+            
+            for i in range(0, len(unique), BATCH_SIZE):
+                batch = unique[i : i + BATCH_SIZE]
+                batch_results = translate_batch(batch, src, tgt)
+                for s_item, t_item in zip(batch, batch_results):
+                    done[s_item] = t_item
+                
+                # Reconstruct current available lines for streaming preview
+                current_lines = [" ".join(done.get(p, p) for p in chunks) if chunks else "" for chunks in pieces]
+                output_placeholder.text_area("Output", "\n".join(current_lines), height=220)
+                bar.progress(min((i + BATCH_SIZE) / max(len(unique), 1), 1.0))
+                
+            lines = [" ".join(done.get(p, p) for p in chunks) if chunks else "" for chunks in pieces]
             source_text = content
             result_json = {
                 "thread_id": st.session_state["thread_id"],
