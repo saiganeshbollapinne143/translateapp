@@ -1,8 +1,10 @@
-﻿--extra-index-url https://download.pytorch.org/whl/cpu
-streamlit
-torch
+﻿streamlit
+ctranslate2>=4.0
 transformers
 sentencepiece
-pypdf
+huggingface_hub
 python-docx
+pypdf
 fpdf2
+uharfbuzz
+chromadb
