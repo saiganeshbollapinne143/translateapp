@@ -88,7 +88,7 @@ st.markdown(
 )
 
 
-# --------------------------------------------------------------------- thread
+# --------------------------------------------------------------------- thread (system-generated, secured)
 def new_thread_id():
     return "THR-" + uuid.uuid4().hex[:8].upper()
 
@@ -97,7 +97,7 @@ if "thread_id" not in st.session_state:
     st.session_state["thread_id"] = new_thread_id()
 
 
-# -------------------------------------------------------------------- chromadb (save only, no UI)
+# -------------------------------------------------------------------- chromadb
 @st.cache_resource
 def get_collection():
     client = chromadb.PersistentClient(
@@ -125,7 +125,30 @@ def _chroma_save(thread_id, source_name, src_lang, tgt_lang, source_text, transl
     )
 
 
+def _chroma_load(thread_id=None, search=""):
+    col = get_collection()
+    where = {"thread_id": thread_id} if thread_id else None
+    if search.strip():
+        total = col.count()
+        if total == 0:
+            return []
+        res = col.query(
+            query_texts=[search.strip()],
+            n_results=min(20, total),
+            where=where,
+        )
+        ids, docs, metas = res["ids"][0], res["documents"][0], res["metadatas"][0]
+    else:
+        res = col.get(where=where)
+        ids, docs, metas = res["ids"], res["documents"], res["metadatas"]
+    records = [{"id": i, "doc": d, "meta": m} for i, d, m in zip(ids, docs, metas)]
+    if not search.strip():
+        records.sort(key=lambda r: r["meta"].get("timestamp", ""), reverse=True)
+    return records[:50]
+
+
 def save_record(thread_id, source_name, src_lang, tgt_lang, source_text, translated_text):
+    """Automatically save every translation under the current thread_id."""
     if HAS_CHROMA:
         return _chroma_save(
             thread_id, source_name, src_lang, tgt_lang, source_text, translated_text
@@ -145,6 +168,22 @@ def save_record(thread_id, source_name, src_lang, tgt_lang, source_text, transla
             },
         }
     )
+
+
+def load_records(thread_id=None, search=""):
+    if HAS_CHROMA:
+        return _chroma_load(thread_id, search)
+    recs = st.session_state.get("history", [])
+    if thread_id:
+        recs = [r for r in recs if r["meta"]["thread_id"] == thread_id]
+    if search.strip():
+        q = search.strip().lower()
+        recs = [
+            r
+            for r in recs
+            if q in r["doc"].lower() or q in r["meta"]["source_preview"].lower()
+        ]
+    return sorted(recs, key=lambda r: r["meta"]["timestamp"], reverse=True)[:50]
 
 
 # ----------------------------------------------------------------------- model
@@ -280,8 +319,13 @@ def make_docx(lines):
 
 
 # -------------------------------------------------------------------------- UI
+# Thread ID — system-generated, secured (read-only)
 tcol1, tcol2 = st.columns([3, 1])
-tcol1.text_input("Thread ID (auto-generated)", value=st.session_state["thread_id"], disabled=True)
+tcol1.text_input(
+    "Thread ID (secured · system-generated)",
+    value=st.session_state["thread_id"],
+    disabled=True,
+)
 tcol2.markdown("<div style='height:1.75rem'></div>", unsafe_allow_html=True)
 if tcol2.button("New thread"):
     st.session_state["thread_id"] = new_thread_id()
@@ -296,7 +340,7 @@ tgt_name = col2.selectbox("Translate to", list(LANGUAGES), index=1)
 uploaded = st.file_uploader("Upload a file", type=["pdf", "txt", "docx", "json"])
 typed = st.text_area("...or paste text", height=120)
 
-# ---- ONLY output on UI: streaming text area ----
+# ---- ONLY text output: streaming ----
 st.subheader("Streaming Output")
 if "streamed_text" not in st.session_state:
     st.session_state["streamed_text"] = ""
@@ -394,6 +438,7 @@ if st.button("Translate", type="primary"):
         st.session_state["streamed_text"] = final_text
         st.session_state["result"] = {"lines": lines, "json": result_json}
 
+        # Automatic history save by secured thread_id
         try:
             save_record(
                 st.session_state["thread_id"],
@@ -404,33 +449,78 @@ if st.button("Translate", type="primary"):
                 final_text,
             )
         except Exception as e:
-            st.warning(f"Translation done, but the record could not be saved: {e}")
+            st.warning(f"Translation done, but history could not be saved: {e}")
 
-        # Final refresh so the single streaming box shows the complete text
         st.rerun()
 
-# Downloads (not text output — optional utility)
+# ---- Download translated file ----
 result = st.session_state.get("result")
 if result:
-    st.markdown("**Download**")
+    st.markdown("---")
+    st.subheader("Download translated file")
     c1, c2, c3, c4 = st.columns(4)
-    c1.download_button("PDF", make_pdf(result["lines"]), "translation.pdf", "application/pdf")
+    c1.download_button(
+        "📄 PDF",
+        make_pdf(result["lines"]),
+        "translation.pdf",
+        "application/pdf",
+        use_container_width=True,
+    )
     c2.download_button(
-        "TXT", "\n".join(result["lines"]).encode("utf-8"), "translation.txt", "text/plain"
+        "📝 TXT",
+        "\n".join(result["lines"]).encode("utf-8"),
+        "translation.txt",
+        "text/plain",
+        use_container_width=True,
     )
     c3.download_button(
-        "DOCX",
+        "📑 DOCX",
         make_docx(result["lines"]),
         "translation.docx",
         "application/vnd.openxmlformats-officedocument.wordprocessingml.document",
+        use_container_width=True,
     )
     c4.download_button(
-        "JSON",
+        "📋 JSON",
         json.dumps(result["json"], ensure_ascii=False, indent=2).encode("utf-8"),
         "translation.json",
         "application/json",
+        use_container_width=True,
     )
     if not find_font():
         st.caption(
             "PDF note: no Unicode font found, so non-Latin text may show as '?'. See setup notes."
         )
+
+# ---- History (auto-saved by secured thread_id) ----
+st.divider()
+st.subheader("Past records (saved by Thread ID)")
+if not HAS_CHROMA:
+    st.caption("History is kept for this browser session only (ChromaDB not installed).")
+
+h1, h2 = st.columns([1, 2])
+scope = h1.radio("Show", ["This thread", "All threads"], horizontal=True)
+search = h2.text_input("Search past translations", placeholder="Type a word or topic...")
+
+try:
+    records = load_records(
+        st.session_state["thread_id"] if scope == "This thread" else None,
+        search,
+    )
+except Exception as e:
+    records = []
+    st.warning(f"Could not load records: {e}")
+
+if not records:
+    st.caption("No saved records yet for this filter.")
+for r in records:
+    m = r["meta"]
+    title = (
+        f"{m.get('timestamp', '')}  ·  {m.get('source_name', '')}  ·  "
+        f"{m.get('source_lang', '')} → {m.get('target_lang', '')}  ·  {m.get('thread_id', '')}"
+    )
+    with st.expander(title):
+        st.markdown("**Source (preview)**")
+        st.text(m.get("source_preview", ""))
+        st.markdown("**Translation**")
+        st.text(r["doc"])
