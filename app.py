@@ -24,8 +24,8 @@ except ImportError:
 
 # ------------------------------------------------------------------ config
 MODEL_NAME = "olob0/nllb-200-distilled-600M-ct2-int8_float16"
-MAX_CHUNK_CHARS = 400
-BATCH_SIZE = 4
+MAX_CHUNK_CHARS = 300
+BATCH_SIZE = 3
 CHROMA_PATH = os.path.join(os.path.dirname(os.path.abspath(__file__)), "chroma_db")
 
 LANGUAGES = {
