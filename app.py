@@ -94,10 +94,10 @@ def new_thread_id():
 
 
 if "thread_id" not in st.session_state:
-    st.session_state["thread_id"] = new_thread_id()  # generated automatically
+    st.session_state["thread_id"] = new_thread_id()
 
 
-# -------------------------------------------------------------------- chromadb
+# -------------------------------------------------------------------- chromadb (save only, no UI)
 @st.cache_resource
 def get_collection():
     client = chromadb.PersistentClient(
@@ -125,34 +125,11 @@ def _chroma_save(thread_id, source_name, src_lang, tgt_lang, source_text, transl
     )
 
 
-def _chroma_load(thread_id=None, search=""):
-    col = get_collection()
-    where = {"thread_id": thread_id} if thread_id else None
-    if search.strip():
-        total = col.count()
-        if total == 0:
-            return []
-        res = col.query(
-            query_texts=[search.strip()],
-            n_results=min(20, total),
-            where=where,
-        )
-        ids, docs, metas = res["ids"][0], res["documents"][0], res["metadatas"][0]
-    else:
-        res = col.get(where=where)
-        ids, docs, metas = res["ids"], res["documents"], res["metadatas"]
-    records = [{"id": i, "doc": d, "meta": m} for i, d, m in zip(ids, docs, metas)]
-    if not search.strip():
-        records.sort(key=lambda r: r["meta"].get("timestamp", ""), reverse=True)
-    return records[:50]
-
-
 def save_record(thread_id, source_name, src_lang, tgt_lang, source_text, translated_text):
     if HAS_CHROMA:
         return _chroma_save(
             thread_id, source_name, src_lang, tgt_lang, source_text, translated_text
         )
-    # Fallback (no ChromaDB installed): keep history for this browser session only
     st.session_state.setdefault("history", []).append(
         {
             "id": uuid.uuid4().hex,
@@ -168,21 +145,6 @@ def save_record(thread_id, source_name, src_lang, tgt_lang, source_text, transla
             },
         }
     )
-
-
-def load_records(thread_id=None, search=""):
-    if HAS_CHROMA:
-        return _chroma_load(thread_id, search)
-    recs = st.session_state.get("history", [])
-    if thread_id:
-        recs = [r for r in recs if r["meta"]["thread_id"] == thread_id]
-    if search.strip():
-        q = search.strip().lower()
-        recs = [
-            r for r in recs
-            if q in r["doc"].lower() or q in r["meta"]["source_preview"].lower()
-        ]
-    return sorted(recs, key=lambda r: r["meta"]["timestamp"], reverse=True)[:50]
 
 
 # ----------------------------------------------------------------------- model
@@ -215,7 +177,7 @@ def translate_batch(texts, src_code, tgt_code):
     for r in results:
         tokens = r.hypotheses[0]
         if tokens and tokens[0] == tgt_code:
-            tokens = tokens[1:]  # drop the language-code token
+            tokens = tokens[1:]
         outputs.append(
             tokenizer.decode(
                 tokenizer.convert_tokens_to_ids(tokens), skip_special_tokens=True
@@ -226,7 +188,6 @@ def translate_batch(texts, src_code, tgt_code):
 
 # ------------------------------------------------------------------- read files
 def split_long(line):
-    """Split a long line into chunks of <= MAX_CHUNK_CHARS at sentence ends."""
     if len(line) <= MAX_CHUNK_CHARS:
         return [line]
     sentences = re.split(r"(?<=[.!?।።؟])\s+", line)
@@ -257,7 +218,6 @@ def read_upload(uploaded):
 
 
 def map_strings(obj, fn):
-    """Apply fn to every string VALUE in a JSON structure (keys untouched)."""
     if isinstance(obj, str):
         return fn(obj)
     if isinstance(obj, list):
@@ -326,6 +286,7 @@ tcol2.markdown("<div style='height:1.75rem'></div>", unsafe_allow_html=True)
 if tcol2.button("New thread"):
     st.session_state["thread_id"] = new_thread_id()
     st.session_state.pop("result", None)
+    st.session_state["streamed_text"] = ""
     st.rerun()
 
 col1, col2 = st.columns(2)
@@ -335,16 +296,16 @@ tgt_name = col2.selectbox("Translate to", list(LANGUAGES), index=1)
 uploaded = st.file_uploader("Upload a file", type=["pdf", "txt", "docx", "json"])
 typed = st.text_area("...or paste text", height=120)
 
-# Persistent streaming output area (only output on UI)
+# ---- ONLY output on UI: streaming text area ----
 st.subheader("Streaming Output")
-output_placeholder = st.empty()
 if "streamed_text" not in st.session_state:
     st.session_state["streamed_text"] = ""
+output_placeholder = st.empty()
 output_placeholder.text_area(
     "Output (streaming...)",
     st.session_state["streamed_text"],
-    height=220,
-    key="stream_out",
+    height=280,
+    key="stream_out_display",
 )
 
 if st.button("Translate", type="primary"):
@@ -355,6 +316,7 @@ if st.button("Translate", type="primary"):
     else:
         st.session_state.pop("result", None)
         st.session_state["streamed_text"] = ""
+        output_placeholder.text_area("Output (streaming...)", "", height=280, key="stream_clear")
 
         try:
             kind, content = read_upload(uploaded) if uploaded else ("txt", typed)
@@ -382,7 +344,7 @@ if st.button("Translate", type="primary"):
                 streamed = "\n".join(accumulated_outputs)
                 st.session_state["streamed_text"] = streamed
                 output_placeholder.text_area(
-                    "Output (streaming...)", streamed, height=220, key=f"stream_{i}"
+                    "Output (streaming...)", streamed, height=280, key=f"stream_j_{i}"
                 )
                 bar.progress(min((i + BATCH_SIZE) / max(len(unique), 1), 1.0))
 
@@ -411,7 +373,7 @@ if st.button("Translate", type="primary"):
                 streamed = "\n".join(current_lines)
                 st.session_state["streamed_text"] = streamed
                 output_placeholder.text_area(
-                    "Output (streaming...)", streamed, height=220, key=f"stream_{i}"
+                    "Output (streaming...)", streamed, height=280, key=f"stream_t_{i}"
                 )
                 bar.progress(min((i + BATCH_SIZE) / max(len(unique), 1), 1.0))
 
@@ -428,8 +390,9 @@ if st.button("Translate", type="primary"):
             }
 
         bar.empty()
+        final_text = "\n".join(lines)
+        st.session_state["streamed_text"] = final_text
         st.session_state["result"] = {"lines": lines, "json": result_json}
-        st.session_state["streamed_text"] = "\n".join(lines)
 
         try:
             save_record(
@@ -438,14 +401,15 @@ if st.button("Translate", type="primary"):
                 src_name,
                 tgt_name,
                 source_text,
-                "\n".join(lines),
+                final_text,
             )
         except Exception as e:
             st.warning(f"Translation done, but the record could not be saved: {e}")
 
+        # Final refresh so the single streaming box shows the complete text
         st.rerun()
 
-# Downloads only (no extra text output)
+# Downloads (not text output — optional utility)
 result = st.session_state.get("result")
 if result:
     st.markdown("**Download**")
@@ -470,35 +434,3 @@ if result:
         st.caption(
             "PDF note: no Unicode font found, so non-Latin text may show as '?'. See setup notes."
         )
-
-# --------------------------------------------------------------------- history
-st.divider()
-st.subheader("Past records")
-if not HAS_CHROMA:
-    st.caption("History is kept for this browser session only.")
-
-h1, h2 = st.columns([1, 2])
-scope = h1.radio("Show", ["This thread", "All threads"], horizontal=True)
-search = h2.text_input("Search past translations", placeholder="Type a word or topic...")
-
-try:
-    records = load_records(
-        st.session_state["thread_id"] if scope == "This thread" else None, search
-    )
-except Exception as e:
-    records = []
-    st.warning(f"Could not load records: {e}")
-
-if not records:
-    st.caption("No saved records yet.")
-for r in records:
-    m = r["meta"]
-    title = (
-        f"{m.get('timestamp', '')}  ·  {m.get('source_name', '')}  ·  "
-        f"{m.get('source_lang', '')} → {m.get('target_lang', '')}  ·  {m.get('thread_id', '')}"
-    )
-    with st.expander(title):
-        st.markdown("**Source (preview)**")
-        st.text(m.get("source_preview", ""))
-        st.markdown("**Translation**")
-        st.text(r["doc"])
