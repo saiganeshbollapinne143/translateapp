@@ -1,8 +1,9 @@
-import glob
 import io
 import json
 import os
 import re
+import tempfile
+import urllib.request
 import uuid
 from datetime import datetime
 
@@ -171,7 +172,7 @@ def load_records(thread_id=None, search=""):
         if search.strip():
             q = search.strip().lower()
             records = [r for r in records if q in r["doc"].lower() or q in r["meta"]["source_preview"].lower()]
-    
+
     records.sort(key=lambda r: r["meta"].get("timestamp", ""), reverse=True)
     return records[:50]
 
@@ -197,6 +198,45 @@ def translate_batch(texts, src_code, tgt_code):
             tokens = tokens[1:]
         outputs.append(tokenizer.decode(tokenizer.convert_tokens_to_ids(tokens), skip_special_tokens=True))
     return outputs
+
+def translate_stream(text, src_code, tgt_code, on_partial=None):
+    """Translate one string, calling on_partial(partial_text) as tokens are generated.
+    Streaming needs beam_size=1. Falls back to normal batch translation if the
+    installed ctranslate2 version has no `callback` support."""
+    tokenizer, translator = load_model()
+    tokenizer.src_lang = src_code
+    source = tokenizer.convert_ids_to_tokens(tokenizer(text, truncation=True, max_length=256).input_ids)
+
+    generated = []
+
+    def decode(tokens):
+        toks = [t for t in tokens if t != tgt_code]
+        return tokenizer.decode(tokenizer.convert_tokens_to_ids(toks), skip_special_tokens=True)
+
+    def callback(step):
+        if step.token == tgt_code:
+            return
+        generated.append(step.token)
+        # update the UI every 2 tokens to keep Streamlit responsive
+        if on_partial and (len(generated) % 2 == 0 or step.is_last):
+            on_partial(decode(generated))
+
+    try:
+        results = translator.translate_batch(
+            [source],
+            target_prefix=[[tgt_code]],
+            beam_size=1,
+            max_decoding_length=300,
+            callback=callback,
+        )
+    except TypeError:
+        # Older ctranslate2: no streaming callback available
+        out = translate_batch([text], src_code, tgt_code)[0]
+        if on_partial:
+            on_partial(out)
+        return out
+
+    return decode(results[0].hypotheses[0])
 
 # ------------------------------------------------------------------ helpers
 def split_long(line):
@@ -240,44 +280,107 @@ def collect_strings(obj, acc):
     map_strings(obj, lambda s: acc.append(s) or s)
     return acc
 
-# ------------------------------------------------------------------ PDF (fixed Unicode support)
-def find_font():
-    candidates = [
-        "font.ttf",
-        "/usr/share/fonts/truetype/noto/NotoSans-Regular.ttf",
-        "/usr/share/fonts/truetype/noto/NotoSansDevanagari-Regular.ttf",
-        "/usr/share/fonts/truetype/dejavu/DejaVuSans.ttf",
-        "C:/Windows/Fonts/Nirmala.ttf",
-        "C:/Windows/Fonts/arial.ttf",
-        "C:/Windows/Fonts/seguisym.ttf",
-    ]
-    for p in candidates:
-        hits = glob.glob(p)
-        if hits and os.path.exists(hits[0]):
-            return hits[0]
-    return None
+# ------------------------------------------------------------------ PDF (self-contained Unicode support)
+# Fonts are downloaded once at runtime into a temp folder, so no fonts/ folder
+# needs to be committed to the repo.
+FONT_CACHE_DIR = os.path.join(tempfile.gettempdir(), "noto_fonts_cache")
+NOTO_BASE = "https://github.com/notofonts/notofonts.github.io/raw/main/fonts/{n}/hinted/ttf/{n}-Regular.ttf"
 
-def make_pdf(lines):
+# Base font (Latin / Cyrillic / Greek) - always loaded
+BASE_FONT = ("NotoSans", NOTO_BASE.format(n="NotoSans"))
+
+# Extra script font needed for each target language
+SCRIPT_FONTS = {
+    "Hindi":     ("NotoDeva",  NOTO_BASE.format(n="NotoSansDevanagari")),
+    "Marathi":   ("NotoDeva",  NOTO_BASE.format(n="NotoSansDevanagari")),
+    "Telugu":    ("NotoTelu",  NOTO_BASE.format(n="NotoSansTelugu")),
+    "Tamil":     ("NotoTaml",  NOTO_BASE.format(n="NotoSansTamil")),
+    "Kannada":   ("NotoKnda",  NOTO_BASE.format(n="NotoSansKannada")),
+    "Malayalam": ("NotoMlym",  NOTO_BASE.format(n="NotoSansMalayalam")),
+    "Bengali":   ("NotoBeng",  NOTO_BASE.format(n="NotoSansBengali")),
+    "Urdu":      ("NotoArab",  NOTO_BASE.format(n="NotoSansArabic")),
+    "Arabic":    ("NotoArab",  NOTO_BASE.format(n="NotoSansArabic")),
+    # CJK: best effort (large files; variable fonts)
+    "Chinese (Simplified)": ("NotoSC", "https://github.com/google/fonts/raw/main/ofl/notosanssc/NotoSansSC%5Bwght%5D.ttf"),
+    "Japanese":             ("NotoJP", "https://github.com/google/fonts/raw/main/ofl/notosansjp/NotoSansJP%5Bwght%5D.ttf"),
+}
+RTL_LANGS = {"Urdu", "Arabic"}
+
+
+@st.cache_resource(show_spinner="Downloading PDF font (first time only)...")
+def get_font_file(family, url):
+    """Download a font once and return its local path (or None on failure)."""
+    try:
+        os.makedirs(FONT_CACHE_DIR, exist_ok=True)
+        path = os.path.join(FONT_CACHE_DIR, f"{family}.ttf")
+        if not (os.path.exists(path) and os.path.getsize(path) > 10_000):
+            req = urllib.request.Request(url, headers={"User-Agent": "Mozilla/5.0"})
+            with urllib.request.urlopen(req, timeout=60) as resp, open(path, "wb") as f:
+                f.write(resp.read())
+        return path
+    except Exception:
+        return None
+
+
+def _latin1_safe(text):
+    """Last-resort: replace characters Helvetica can't encode so fpdf never crashes."""
+    return text.encode("latin-1", "replace").decode("latin-1")
+
+
+@st.cache_data(show_spinner=False)
+def make_pdf(lines, target_lang="English"):
+    lines = list(lines)
     pdf = FPDF()
     pdf.set_auto_page_break(auto=True, margin=15)
     pdf.add_page()
-    
-    font_path = find_font()
-    if font_path:
-        pdf.add_font("Unicode", "", font_path)
-        pdf.set_font("Unicode", size=11)
+
+    unicode_ok = False
+    base_family, base_url = BASE_FONT
+    base_path = get_font_file(base_family, base_url)
+    if base_path:
+        try:
+            pdf.add_font(base_family, "", base_path)
+            pdf.set_font(base_family, size=11)
+            unicode_ok = True
+        except Exception:
+            unicode_ok = False
+
+    if unicode_ok:
+        fallbacks = []
+        if target_lang in SCRIPT_FONTS:
+            fam, url = SCRIPT_FONTS[target_lang]
+            p = get_font_file(fam, url)
+            if p:
+                try:
+                    pdf.add_font(fam, "", p)
+                    fallbacks.append(fam)
+                except Exception:
+                    pass
+        if fallbacks:
+            pdf.set_fallback_fonts(fallbacks)
+        # Proper shaping for Indic / Arabic scripts (needs `uharfbuzz`)
+        try:
+            pdf.set_text_shaping(True)
+        except Exception:
+            pass
     else:
-        # Last resort – will produce ? for non-Latin text
         pdf.set_font("Helvetica", size=11)
-    
+
+    align = "R" if target_lang in RTL_LANGS else "L"
+
     for line in lines:
         if not line.strip():
             pdf.ln(5)
             continue
-        # Never force latin-1 replace – let the Unicode font handle it
-        pdf.multi_cell(0, 6, line, new_x="LMARGIN", new_y="NEXT")
-    
+        text = line if unicode_ok else _latin1_safe(line)
+        try:
+            pdf.multi_cell(pdf.epw, 6, text, new_x="LMARGIN", new_y="NEXT", align=align)
+        except Exception:
+            # Never let one bad line kill the whole download
+            pdf.multi_cell(pdf.epw, 6, _latin1_safe(text), new_x="LMARGIN", new_y="NEXT")
+
     return bytes(pdf.output())
+
 
 def make_docx(lines):
     doc = Document()
@@ -313,6 +416,11 @@ output_placeholder.text_area(
     key="stream_display",
 )
 
+def show(text):
+    """Push text into the Streaming Output box (fresh key each call so it always refreshes)."""
+    st.session_state.streamed_text = text
+    output_placeholder.text_area("Output", text, height=280, key=f"out_{uuid.uuid4().hex}")
+
 if st.button("Translate", type="primary"):
     if src_name == tgt_name:
         st.info("Source and target languages are the same.")
@@ -321,7 +429,7 @@ if st.button("Translate", type="primary"):
     else:
         st.session_state.result = None
         st.session_state.streamed_text = ""
-        
+
         try:
             kind, content = read_upload(uploaded) if uploaded else ("txt", typed)
         except Exception as e:
@@ -334,20 +442,19 @@ if st.button("Translate", type="primary"):
         if kind == "json":
             strings = collect_strings(content, [])
             unique = list(dict.fromkeys(s for s in strings if s.strip()))
-            unique.sort(key=len)
             done = {}
             accumulated = []
 
-            for i in range(0, len(unique), BATCH_SIZE):
-                batch = unique[i:i + BATCH_SIZE]
-                results = translate_batch(batch, src, tgt)
-                for s, t in zip(batch, results):
-                    done[s] = t
-                    accumulated.append(t)
-                streamed = "\n".join(accumulated)
-                st.session_state.streamed_text = streamed
-                output_placeholder.text_area("Output", streamed, height=280, key=f"j_{i}")
-                bar.progress(min((i + BATCH_SIZE) / max(len(unique), 1), 1.0))
+            for n, s in enumerate(unique):
+                base = "\n".join(accumulated)
+                t = translate_stream(
+                    s, src, tgt,
+                    on_partial=lambda p, base=base: show(f"{base}\n{p}" if base else p),
+                )
+                done[s] = t
+                accumulated.append(t)
+                show("\n".join(accumulated))
+                bar.progress((n + 1) / max(len(unique), 1))
 
             lines = [done.get(s, s) for s in strings]
             source_text = "\n".join(strings)
@@ -356,21 +463,22 @@ if st.button("Translate", type="primary"):
             src_lines = content.splitlines()
             pieces = [split_long(l.strip()) if l.strip() else [] for l in src_lines]
             flat = [p for chunks in pieces for p in chunks]
-            unique = list(dict.fromkeys(s for s in flat if s.strip()))
-            unique.sort(key=len)
+            unique = list(dict.fromkeys(s for s in flat if s.strip()))  # document order
             done = {}
 
-            for i in range(0, len(unique), BATCH_SIZE):
-                batch = unique[i:i + BATCH_SIZE]
-                results = translate_batch(batch, src, tgt)
-                for s, t in zip(batch, results):
-                    done[s] = t
+            def render(extra=None):
+                m = {**done, **(extra or {})}
+                rows = [" ".join(m[p] for p in chunks if p in m) for chunks in pieces]
+                return "\n".join(rows).rstrip()
 
-                current_lines = [" ".join(done.get(p, p) for p in chunks) if chunks else "" for chunks in pieces]
-                streamed = "\n".join(current_lines)
-                st.session_state.streamed_text = streamed
-                output_placeholder.text_area("Output", streamed, height=280, key=f"t_{i}")
-                bar.progress(min((i + BATCH_SIZE) / max(len(unique), 1), 1.0))
+            for n, s in enumerate(unique):
+                t = translate_stream(
+                    s, src, tgt,
+                    on_partial=lambda p, s=s: show(render({s: p})),
+                )
+                done[s] = t
+                show(render())
+                bar.progress((n + 1) / max(len(unique), 1))
 
             lines = [" ".join(done.get(p, p) for p in chunks) if chunks else "" for chunks in pieces]
             source_text = content
@@ -384,7 +492,7 @@ if st.button("Translate", type="primary"):
         bar.empty()
         final_text = "\n".join(lines)
         st.session_state.streamed_text = final_text
-        st.session_state.result = {"lines": lines, "json": result_json}
+        st.session_state.result = {"lines": lines, "json": result_json, "target": tgt_name}
 
         try:
             save_record(
@@ -403,16 +511,19 @@ if result:
     st.markdown("---")
     st.subheader("Download translated file")
     c1, c2, c3, c4 = st.columns(4)
-    
-    c1.download_button("📄 PDF", make_pdf(result["lines"]), "translation.pdf", "application/pdf", use_container_width=True)
+
+    try:
+        pdf_bytes = make_pdf(tuple(result["lines"]), result.get("target", "English"))
+        c1.download_button("📄 PDF", pdf_bytes, "translation.pdf", "application/pdf", use_container_width=True)
+    except Exception as e:
+        c1.button("📄 PDF (error)", disabled=True, use_container_width=True)
+        st.warning(f"PDF could not be generated: {e}")
+
     c2.download_button("📝 TXT", "\n".join(result["lines"]).encode("utf-8"), "translation.txt", "text/plain", use_container_width=True)
     c3.download_button("📑 DOCX", make_docx(result["lines"]), "translation.docx",
                        "application/vnd.openxmlformats-officedocument.wordprocessingml.document", use_container_width=True)
     c4.download_button("📋 JSON", json.dumps(result["json"], ensure_ascii=False, indent=2).encode("utf-8"),
                        "translation.json", "application/json", use_container_width=True)
-
-    if not find_font():
-        st.warning("No Unicode font found. PDF may show '?' for non-Latin text. Install Noto Sans or DejaVu fonts.")
 
 # ------------------------------------------------------------------ history
 st.divider()
