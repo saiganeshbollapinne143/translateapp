@@ -57,30 +57,51 @@ st.markdown("""
 .block-container { padding-top: 4.5rem !important; max-width: 820px; }
 
 .title-card {
-    background: #0B2A5B; border-radius: 12px;
-    padding: 14px 22px; margin-bottom: 1.2rem;
+    background: #0B2A5B;
+    border-radius: 12px;
+    padding: 14px 22px;
+    margin-bottom: 1.2rem;
+    text-align: center;
 }
 .title-card h1 {
-    color: #FFFFFF !important; font-size: 1.25rem; font-weight: 700;
-    margin: 0; white-space: nowrap; overflow: hidden; text-overflow: ellipsis;
+    margin: 0;
+    padding: 0;
+    font-size: 1.35rem;
+    font-weight: 700;
+    letter-spacing: 0.5px;
+    white-space: nowrap;
+    overflow: hidden;
+    text-overflow: ellipsis;
 }
-.title-card h1 .ait { color: #FFC107 !important; }
+.title-card h1 .ait {
+    color: #FFC107 !important;   /* Yellow */
+}
+.title-card h1 .rest {
+    color: #FFFFFF !important;   /* White */
+}
 
 .stButton > button, .stDownloadButton > button,
 [data-testid="stFileUploader"] button {
-    background: #FFC107 !important; color: #1B1B1B !important;
-    border: none !important; border-radius: 8px !important; font-weight: 600 !important;
+    background: #FFC107 !important;
+    color: #1B1B1B !important;
+    border: none !important;
+    border-radius: 8px !important;
+    font-weight: 600 !important;
 }
 .stButton > button:hover, .stDownloadButton > button:hover {
-    background: #FFB300 !important; color: #000000 !important;
+    background: #FFB300 !important;
+    color: #000000 !important;
 }
 .stDownloadButton > button { width: 100%; }
 </style>
+
 <div class="title-card">
-    <h1><span class="ait">AIT</span> GLOBAL TECHNOLOGIES</h1>
+    <h1>
+        <span class="ait">AIT</span>
+        <span class="rest"> GLOBAL TECHNOLOGIES</span>
+    </h1>
 </div>
 """, unsafe_allow_html=True)
-
 # ------------------------------------------------------------------ thread
 def new_thread_id():
     return "THR-" + uuid.uuid4().hex[:8].upper()
