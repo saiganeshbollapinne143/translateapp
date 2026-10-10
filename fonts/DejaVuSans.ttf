@@ -1,0 +1,26 @@
+from pathlib import Path
+from fpdf import FPDF
+
+def make_pdf(lines):
+    pdf = FPDF()
+    pdf.add_page()
+    
+    # Robust path that works both locally and on Streamlit Cloud
+    font_path = Path(__file__).parent / "fonts" / "DejaVuSans.ttf"
+    
+    if not font_path.is_file():
+        raise FileNotFoundError(f"Font not found: {font_path}")
+    
+    # Optional: quick sanity check
+    with open(font_path, "rb") as f:
+        header = f.read(4)
+        if header not in (b"\x00\x01\x00\x00", b"OTTO", b"true"):
+            raise ValueError(f"Not a valid TTF/OTF font (header={header!r})")
+    
+    pdf.add_font("Unicode", "", str(font_path))
+    pdf.set_font("Unicode", size=12)
+    
+    for line in lines:
+        pdf.multi_cell(0, 8, line)
+    
+    return bytes(pdf.output())
