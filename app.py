@@ -352,7 +352,7 @@ if st.button("Translate", type="primary"):
         src, tgt = LANGUAGES[src_name], LANGUAGES[tgt_name]
         bar = st.progress(0.0, text="Translating...")
         
-        st.subheader("Streaming Output File")
+        st.subheader("Streaming Output")
         output_placeholder = st.empty()
         output_placeholder.text_area("Output (streaming...)", "", height=220)
 
@@ -421,7 +421,7 @@ if st.button("Translate", type="primary"):
 
 result = st.session_state.get("result")
 if result:
-    st.markdown("**Download Streaming Output File**")
+    st.markdown("**Download**")
     c1, c2, c3, c4 = st.columns(4)
     c1.download_button("PDF", make_pdf(result["lines"]), "translation.pdf", "application/pdf")
     c2.download_button("TXT", "\n".join(result["lines"]).encode("utf-8"), "translation.txt", "text/plain")
