@@ -44,7 +44,7 @@ st.markdown(
     <style>
     .stApp, [data-testid="stHeader"] { background: #FFFFFF; }
     .stApp, .stApp p, .stApp label, .stApp span, .stApp li { color: #1B1B1B; }
-    .block-container { padding-top: 2rem; max-width: 820px; }
+    .block-container { padding-top: 4.5rem !important; max-width: 820px; }
 
     .title-card {
         background: #0B2A5B; border-radius: 12px;
