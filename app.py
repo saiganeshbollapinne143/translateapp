@@ -3,6 +3,7 @@ import json
 import os
 import re
 import tempfile
+import time
 import urllib.request
 import uuid
 from datetime import datetime
@@ -213,30 +214,41 @@ def translate_stream(text, src_code, tgt_code, on_partial=None):
         toks = [t for t in tokens if t != tgt_code]
         return tokenizer.decode(tokenizer.convert_tokens_to_ids(toks), skip_special_tokens=True)
 
+    # NOTE: CTranslate2 calls this from its own worker thread, which has no
+    # Streamlit session. So it must NOT touch any st.* element - it only
+    # collects tokens. The main thread below reads them and updates the UI.
     def callback(step):
-        if step.token == tgt_code:
-            return
-        generated.append(step.token)
-        # update the UI every 2 tokens to keep Streamlit responsive
-        if on_partial and (len(generated) % 2 == 0 or step.is_last):
-            on_partial(decode(generated))
+        if step.token != tgt_code:
+            generated.append(step.token)
+        return None  # returning True would stop decoding
 
     try:
-        results = translator.translate_batch(
+        futures = translator.translate_batch(
             [source],
             target_prefix=[[tgt_code]],
             beam_size=1,
             max_decoding_length=300,
             callback=callback,
+            asynchronous=True,
         )
     except TypeError:
-        # Older ctranslate2: no streaming callback available
+        # Older ctranslate2: no streaming callback / async support
         out = translate_batch([text], src_code, tgt_code)[0]
         if on_partial:
             on_partial(out)
         return out
 
-    return decode(results[0].hypotheses[0])
+    future = futures[0]
+    last_n = 0
+    while not future.done():
+        n = len(generated)
+        if on_partial and n != last_n:
+            on_partial(decode(list(generated)))
+            last_n = n
+        time.sleep(0.05)
+
+    result = future.result()
+    return decode(result.hypotheses[0])
 
 # ------------------------------------------------------------------ helpers
 def split_long(line):
@@ -402,7 +414,7 @@ if tcol2.button("New thread"):
 
 col1, col2 = st.columns(2)
 src_name = col1.selectbox("Translate from", list(LANGUAGES), index=0)
-tgt_name = col2.selectbox("Translate to", list(LANGUAGES), index=1)
+tgt_name = col2.selectbox("Translate to", list(LANGUAGES), index=2)  # Telugu
 
 uploaded = st.file_uploader("Upload a file", type=["pdf", "txt", "docx", "json"])
 typed = st.text_area("...or paste text", height=120)
