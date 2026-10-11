@@ -145,7 +145,7 @@ with st.container(border=True):
     live = st.empty()
     progress = st.empty()
 
-    if st.button("Translate", type="primary", use_container_width=True):
+    if st.button("Translate document", type="primary", use_container_width=True):
         if src == tgt:
             st.warning("Choose different source and target languages.")
         elif not file and not pasted.strip():
