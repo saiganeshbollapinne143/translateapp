@@ -15,7 +15,7 @@ from fpdf import FPDF
 from pypdf import PdfReader
 from huggingface_hub import snapshot_download
 from transformers import AutoTokenizer
-os.environ["STREAMLIT_SERVER_MAX_UPLOAD_SIZE"] = "5"
+
 # Optional ChromaDB
 try:
     import chromadb
@@ -329,7 +329,296 @@ def preview(text):
         return text
     return text[:DISPLAY_LIMIT] + "\n\n... (preview only - use the download buttons for the full text)"
 
-# ------------------------------------------------------------------ PDF (self-contained
-st.write("DEBUG 1")   # right after the title-card st.markdown(...) block
-st.write("DEBUG 2")   # right before the line: tcol1, tcol2 = st.columns([3, 1])
-st.write("DEBUG 3") 
+# ------------------------------------------------------------------ PDF (self-contained Unicode support)
+FONT_CACHE_DIR = os.path.join(tempfile.gettempdir(), "noto_fonts_cache")
+NOTO_BASE = "https://github.com/notofonts/notofonts.github.io/raw/main/fonts/{n}/hinted/ttf/{n}-Regular.ttf"
+
+BASE_FONT = ("NotoSans", NOTO_BASE.format(n="NotoSans"))
+
+SCRIPT_FONTS = {
+    "Hindi":     ("NotoDeva",  NOTO_BASE.format(n="NotoSansDevanagari")),
+    "Marathi":   ("NotoDeva",  NOTO_BASE.format(n="NotoSansDevanagari")),
+    "Telugu":    ("NotoTelu",  NOTO_BASE.format(n="NotoSansTelugu")),
+    "Tamil":     ("NotoTaml",  NOTO_BASE.format(n="NotoSansTamil")),
+    "Kannada":   ("NotoKnda",  NOTO_BASE.format(n="NotoSansKannada")),
+    "Malayalam": ("NotoMlym",  NOTO_BASE.format(n="NotoSansMalayalam")),
+    "Bengali":   ("NotoBeng",  NOTO_BASE.format(n="NotoSansBengali")),
+    "Urdu":      ("NotoArab",  NOTO_BASE.format(n="NotoSansArabic")),
+    "Arabic":    ("NotoArab",  NOTO_BASE.format(n="NotoSansArabic")),
+    "Chinese (Simplified)": ("NotoSC", "https://github.com/google/fonts/raw/main/ofl/notosanssc/NotoSansSC%5Bwght%5D.ttf"),
+    "Japanese":             ("NotoJP", "https://github.com/google/fonts/raw/main/ofl/notosansjp/NotoSansJP%5Bwght%5D.ttf"),
+}
+RTL_LANGS = {"Urdu", "Arabic"}
+
+
+@st.cache_resource(show_spinner="Downloading PDF font (first time only)...")
+def get_font_file(family, url):
+    try:
+        os.makedirs(FONT_CACHE_DIR, exist_ok=True)
+        path = os.path.join(FONT_CACHE_DIR, f"{family}.ttf")
+        if not (os.path.exists(path) and os.path.getsize(path) > 10_000):
+            req = urllib.request.Request(url, headers={"User-Agent": "Mozilla/5.0"})
+            with urllib.request.urlopen(req, timeout=60) as resp, open(path, "wb") as f:
+                f.write(resp.read())
+        return path
+    except Exception:
+        return None
+
+
+def _latin1_safe(text):
+    return text.encode("latin-1", "replace").decode("latin-1")
+
+
+@st.cache_data(show_spinner=False)
+def make_pdf(lines, target_lang="English"):
+    lines = list(lines)
+    pdf = FPDF()
+    pdf.set_auto_page_break(auto=True, margin=15)
+    pdf.add_page()
+
+    unicode_ok = False
+    base_family, base_url = BASE_FONT
+    base_path = get_font_file(base_family, base_url)
+    if base_path:
+        try:
+            pdf.add_font(base_family, "", base_path)
+            pdf.set_font(base_family, size=11)
+            unicode_ok = True
+        except Exception:
+            unicode_ok = False
+
+    if unicode_ok:
+        fallbacks = []
+        if target_lang in SCRIPT_FONTS:
+            fam, url = SCRIPT_FONTS[target_lang]
+            p = get_font_file(fam, url)
+            if p:
+                try:
+                    pdf.add_font(fam, "", p)
+                    fallbacks.append(fam)
+                except Exception:
+                    pass
+        if fallbacks:
+            pdf.set_fallback_fonts(fallbacks)
+        try:
+            pdf.set_text_shaping(True)
+        except Exception:
+            pass
+    else:
+        pdf.set_font("Helvetica", size=11)
+
+    align = "R" if target_lang in RTL_LANGS else "L"
+
+    for line in lines:
+        if not line.strip():
+            pdf.ln(5)
+            continue
+        text = line if unicode_ok else _latin1_safe(line)
+        try:
+            pdf.multi_cell(pdf.epw, 6, text, new_x="LMARGIN", new_y="NEXT", align=align)
+        except Exception:
+            pdf.multi_cell(pdf.epw, 6, _latin1_safe(text), new_x="LMARGIN", new_y="NEXT")
+
+    return bytes(pdf.output())
+
+
+def make_docx(lines):
+    doc = Document()
+    for line in lines:
+        doc.add_paragraph(line)
+    buf = io.BytesIO()
+    doc.save(buf)
+    return buf.getvalue()
+
+# ------------------------------------------------------------------ UI
+tcol1, tcol2 = st.columns([3, 1])
+tcol1.text_input("Thread ID (system-generated)", value=st.session_state.thread_id, disabled=True)
+tcol2.markdown("<div style='height:1.75rem'></div>", unsafe_allow_html=True)
+if tcol2.button("New thread"):
+    st.session_state.thread_id = new_thread_id()
+    st.session_state.result = None
+    st.session_state.streamed_text = ""
+    st.rerun()
+
+col1, col2 = st.columns(2)
+src_name = col1.selectbox("Translate from", list(LANGUAGES), index=0)
+tgt_name = col2.selectbox("Translate to", list(LANGUAGES), index=2)  # Telugu
+
+uploaded = st.file_uploader(f"Upload a file (max {MAX_UPLOAD_MB} MB)", type=["pdf", "txt", "docx", "json"])
+if uploaded and uploaded.size > MAX_UPLOAD_MB * 1024 * 1024:
+    st.error(f"File is {uploaded.size / 1024 / 1024:.1f} MB. The limit is {MAX_UPLOAD_MB} MB.")
+    uploaded = None
+typed = st.text_area("...or paste text", height=120)
+
+oc1, oc2 = st.columns(2)
+auto_clean = oc1.checkbox("Auto-remove meaningless repeats", value=True,
+                          help="Removes repeated lines, number-only lines (page numbers) and repeated-word loops.")
+remove_global = oc2.checkbox("Remove repeated lines anywhere in the document", value=True,
+                             help="Untick if your document legitimately repeats the same line.")
+
+st.subheader("Streaming Output")
+output_placeholder = st.empty()
+output_placeholder.text_area(
+    "Output",
+    preview(st.session_state.streamed_text),
+    height=280,
+    key="stream_display",
+)
+
+def show(text):
+    """Push text into the Streaming Output box (fresh key each call so it always refreshes)."""
+    st.session_state.streamed_text = text
+    output_placeholder.text_area("Output", preview(text), height=280, key=f"out_{uuid.uuid4().hex}")
+
+if st.button("Translate", type="primary"):
+    if src_name == tgt_name:
+        st.info("Source and target languages are the same.")
+    elif not uploaded and not typed.strip():
+        st.warning("Upload a file or paste some text first.")
+    else:
+        st.session_state.result = None
+        st.session_state.streamed_text = ""
+
+        try:
+            kind, content = read_upload(uploaded) if uploaded else ("txt", typed)
+        except Exception as e:
+            st.error(f"Could not read the file: {e}")
+            st.stop()
+
+        src, tgt = LANGUAGES[src_name], LANGUAGES[tgt_name]
+        bar = st.progress(0.0, text="Translating...")
+
+        if kind == "json":
+            strings = collect_strings(content, [])
+            unique = list(dict.fromkeys(s for s in strings if s.strip()))
+            done = {}
+            accumulated = []
+
+            for n, s in enumerate(unique):
+                base = "\n".join(accumulated[-200:])
+                t = translate_stream(
+                    s, src, tgt,
+                    on_partial=lambda p, base=base: show(f"{base}\n{p}" if base else p),
+                    clean=auto_clean,
+                )
+                done[s] = t
+                accumulated.append(t)
+                show("\n".join(accumulated[-200:]))
+                bar.progress((n + 1) / max(len(unique), 1))
+
+            lines = [done.get(s, s) for s in strings]
+            source_text = "\n".join(strings)
+            result_json = map_strings(content, lambda s: done.get(s, s))
+        else:
+            src_lines = content.splitlines()
+            if auto_clean:
+                src_lines = dedupe_lines(src_lines, remove_global)
+                content = "\n".join(src_lines)
+
+            pieces = []
+            for l in src_lines:
+                chunks = split_long(l.strip()) if l.strip() else []
+                if auto_clean:  # drop sentences repeated back-to-back inside one line
+                    chunks = [c for i, c in enumerate(chunks) if i == 0 or c != chunks[i - 1]]
+                pieces.append(chunks)
+
+            flat = [p for chunks in pieces for p in chunks]
+            unique = list(dict.fromkeys(s for s in flat if s.strip()))
+            done = {}
+
+            def render(extra=None):
+                m = {**done, **(extra or {})}
+                rows = [" ".join(m[p] for p in chunks if p in m) for chunks in pieces]
+                return "\n".join(rows).rstrip()
+
+            if len(unique) > LARGE_THRESHOLD:
+                # Large file: batched translation (shortest first to reduce padding)
+                order = sorted(unique, key=len)
+                for i in range(0, len(order), BIG_BATCH):
+                    batch = order[i:i + BIG_BATCH]
+                    outs = translate_batch(batch, src, tgt, clean=auto_clean)
+                    done.update(zip(batch, outs))
+                    if (i // BIG_BATCH) % 10 == 0:
+                        show("(Large file - showing the latest part only)\n..." + render()[-3000:])
+                    bar.progress(min((i + BIG_BATCH) / len(order), 1.0))
+            else:
+                for n, s in enumerate(unique):
+                    t = translate_stream(
+                        s, src, tgt,
+                        on_partial=lambda p, s=s: show(render({s: p})),
+                        clean=auto_clean,
+                    )
+                    done[s] = t
+                    show(render())
+                    bar.progress((n + 1) / max(len(unique), 1))
+
+            lines = [" ".join(done.get(p, p) for p in chunks) if chunks else "" for chunks in pieces]
+            source_text = content
+            result_json = {
+                "thread_id": st.session_state.thread_id,
+                "source_language": src_name,
+                "target_language": tgt_name,
+                "translated_text": "\n".join(lines),
+            }
+
+        bar.empty()
+        final_text = "\n".join(lines)
+        show(final_text)
+        st.session_state.result = {"lines": lines, "json": result_json, "target": tgt_name}
+
+        try:
+            save_record(
+                st.session_state.thread_id,
+                uploaded.name if uploaded else "pasted text",
+                src_name, tgt_name, source_text, final_text,
+            )
+        except Exception as e:
+            st.warning(f"Translation done, but history could not be saved: {e}")
+
+# ------------------------------------------------------------------ downloads
+result = st.session_state.result
+if result:
+    st.markdown("---")
+    st.subheader("Download translated file")
+    c1, c2, c3, c4 = st.columns(4)
+
+    try:
+        pdf_bytes = make_pdf(tuple(result["lines"]), result.get("target", "English"))
+        c1.download_button("📄 PDF", pdf_bytes, "translation.pdf", "application/pdf", use_container_width=True)
+    except Exception as e:
+        c1.button("📄 PDF (error)", disabled=True, use_container_width=True)
+        st.warning(f"PDF could not be generated: {e}")
+
+    c2.download_button("📝 TXT", "\n".join(result["lines"]).encode("utf-8"), "translation.txt", "text/plain", use_container_width=True)
+    c3.download_button("📑 DOCX", make_docx(result["lines"]), "translation.docx",
+                       "application/vnd.openxmlformats-officedocument.wordprocessingml.document", use_container_width=True)
+    c4.download_button("📋 JSON", json.dumps(result["json"], ensure_ascii=False, indent=2).encode("utf-8"),
+                       "translation.json", "application/json", use_container_width=True)
+
+# ------------------------------------------------------------------ history
+st.divider()
+st.subheader("Past records")
+if not HAS_CHROMA:
+    st.caption("History is session-only (ChromaDB not installed).")
+
+h1, h2 = st.columns([1, 2])
+scope = h1.radio("Show", ["This thread", "All threads"], horizontal=True)
+search = h2.text_input("Search", placeholder="Type a word...")
+
+try:
+    records = load_records(st.session_state.thread_id if scope == "This thread" else None, search)
+except Exception as e:
+    records = []
+    st.warning(f"Could not load records: {e}")
+
+if not records:
+    st.caption("No saved records yet.")
+else:
+    for r in records:
+        m = r["meta"]
+        title = f"{m.get('timestamp', '')}  ·  {m.get('source_name', '')}  ·  {m.get('source_lang', '')} → {m.get('target_lang', '')}"
+        with st.expander(title):
+            st.markdown("**Source (preview)**")
+            st.text(m.get("source_preview", ""))
+            st.markdown("**Translation**")
+            st.text(r["doc"])
