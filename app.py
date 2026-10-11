@@ -1,3 +1,70 @@
+import importlib, io, json, os, re, tempfile, time, urllib.request, uuid
+from datetime import datetime
+import streamlit as st
+from transformers import AutoTokenizer
+from huggingface_hub import snapshot_download
+from pypdf import PdfReader
+from docx import Document
+from fpdf import FPDF
+
+# AIT GLOBAL TECHNOLOGIES — chunk-streaming translator for long documents
+MODEL_NAME = "olob0/nllb-200-distilled-600M-ct2-int8_float16"
+CHUNK_CHARS = 700                 # small chunks keep model input within limits
+MAX_INPUT_TOKENS = 256
+LANGUAGES = {"English":"eng_Latn", "Hindi":"hin_Deva", "Telugu":"tel_Telu", "Tamil":"tam_Taml", "Kannada":"kan_Knda", "Malayalam":"mal_Mlym", "Bengali":"ben_Beng", "Marathi":"mar_Deva", "Urdu":"urd_Arab", "French":"fra_Latn", "German":"deu_Latn", "Spanish":"spa_Latn", "Italian":"ita_Latn", "Arabic":"arb_Arab", "Chinese (Simplified)":"zho_Hans", "Japanese":"jpn_Jpan"}
+
+st.set_page_config(page_title="AIT Global Technologies Translator", page_icon="🌍", layout="centered")
+st.markdown("""<style>
+.stApp{background:#fff;color:#202124}.block-container{max-width:900px;padding-top:2rem}
+.brand{background:#0b2a5b;border-radius:12px;text-align:center;padding:18px;margin-bottom:18px}
+.brand h1{font-size:27px;margin:0;color:#fff}.brand span{color:#ffc107}
+.stButton>button,.stDownloadButton>button{background:#ffc107;color:#172033;border:0;border-radius:8px;font-weight:700}
+.stProgress>div>div>div>div{background:#0b2a5b}
+.livebox{background:#f3f7ff;border:1px solid #c8d8f4;border-left:5px solid #0b2a5b;border-radius:8px;padding:14px;white-space:pre-wrap;overflow-wrap:anywhere;min-height:100px}
+</style><div class="brand"><h1><span>AIT</span> GLOBAL TECHNOLOGIES TRANSLATOR</h1></div>""", unsafe_allow_html=True)
+
+@st.cache_resource(show_spinner="Downloading/loading translation model (first run only)...")
+def load_model():
+    try:
+        ctranslate2 = importlib.import_module("ctranslate2")
+    except ImportError as exc:
+        raise ImportError("CTranslate2 is required. Install it with: pip install ctranslate2") from exc
+    path = snapshot_download(MODEL_NAME)
+    tok = AutoTokenizer.from_pretrained(path)
+    model = ctranslate2.Translator(path, device="cpu", compute_type="int8", inter_threads=1, intra_threads=2)
+    return tok, model
+
+def read_file(file):
+    data, name = file.getvalue(), file.name.lower()
+    if name.endswith('.pdf'):
+        return 'text', '\n\n'.join(p.extract_text() or '' for p in PdfReader(io.BytesIO(data)).pages)
+    if name.endswith('.docx'):
+        doc = Document(io.BytesIO(data)); return 'text', '\n'.join(p.text for p in doc.paragraphs)
+    if name.endswith('.json'):
+        return 'json', json.loads(data.decode('utf-8-sig'))
+    return 'text', data.decode('utf-8-sig', errors='replace')
+
+def split_text(text, limit=CHUNK_CHARS):
+    # Split paragraphs/sentences first, then hard-split any unusually long sentence.
+    out=[]
+    for line in text.splitlines() or [text]:
+        if not line.strip(): out.append(''); continue
+        parts=re.split(r'(?<=[.!?।።؟])\s+', line.strip()); cur=''
+        for part in parts:
+            while len(part)>limit:
+                if cur: out.append(cur); cur=''
+                out.append(part[:limit]); part=part[limit:]
+            if cur and len(cur)+1+len(part)>limit: out.append(cur); cur=part
+            else: cur=(cur+' '+part).strip()
+        if cur: out.append(cur)
+    return out
+
+def translate_one(text, src, tgt, on_partial):
+    if not text.strip(): return text
+    tok, model = load_model(); tok.src_lang=src
+    ids=tok(text, truncation=True, max_length=MAX_INPUT_TOKENS).input_ids
+    source=tok.convert_ids_to_tokens(ids); generated=[]
+    def decode(tokens):
         tokens=[x for x in tokens if x != tgt]
         return tok.decode(tok.convert_tokens_to_ids(tokens), skip_special_tokens=True)
     def callback(step):
