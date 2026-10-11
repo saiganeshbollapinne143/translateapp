@@ -330,3 +330,6 @@ def preview(text):
     return text[:DISPLAY_LIMIT] + "\n\n... (preview only - use the download buttons for the full text)"
 
 # ------------------------------------------------------------------ PDF (self-contained
+st.write("DEBUG 1")   # right after the title-card st.markdown(...) block
+st.write("DEBUG 2")   # right before the line: tcol1, tcol2 = st.columns([3, 1])
+st.write("DEBUG 3") 
