@@ -15,7 +15,7 @@ from fpdf import FPDF
 from pypdf import PdfReader
 from huggingface_hub import snapshot_download
 from transformers import AutoTokenizer
-
+os.environ["STREAMLIT_SERVER_MAX_UPLOAD_SIZE"] = "5"
 # Optional ChromaDB
 try:
     import chromadb
@@ -330,4 +330,3 @@ def preview(text):
     return text[:DISPLAY_LIMIT] + "\n\n... (preview only - use the download buttons for the full text)"
 
 # ------------------------------------------------------------------ PDF (self-contained
-st.write("DEBUG: reached UI section")
