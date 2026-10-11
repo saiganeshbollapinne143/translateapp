@@ -10,7 +10,7 @@ from fpdf import FPDF
 MODEL="olob0/nllb-200-distilled-600M-ct2-int8_float16"
 LANG={"English":"eng_Latn","Hindi":"hin_Deva","Telugu":"tel_Telu","Tamil":"tam_Taml","Kannada":"kan_Knda","Malayalam":"mal_Mlym","Bengali":"ben_Beng","Marathi":"mar_Deva","Urdu":"urd_Arab","French":"fra_Latn","German":"deu_Latn","Spanish":"spa_Latn","Italian":"ita_Latn","Arabic":"arb_Arab","Chinese":"zho_Hans","Japanese":"jpn_Jpan"}
 
-st.set_page_config(page_title="Document Translation",page_icon="🌐",layout="centered")
+st.set_page_config(page_title="AIT GLOBAL TRANSLATOR",page_icon="🌐",layout="centered")
 st.markdown("""<style>
 .stApp{background:#f4f7fc;color:#18243b}
 .block-container{max-width:900px;padding:1.5rem 1rem 3rem}
