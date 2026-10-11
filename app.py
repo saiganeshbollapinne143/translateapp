@@ -28,7 +28,7 @@ textarea,input{border-radius:9px!important}
 div[data-testid="stFileUploader"]{background:#fff;border:1px dashed #9eb5d5;border-radius:12px;padding:10px}
 small{color:#62718a}
 </style>
-<div class="hero"><h1><span>Document</span> Translation</h1><p>Multilingual documents · Live chunk output · Downloadable results</p></div>""",unsafe_allow_html=True)
+<div class="hero"><h1><span>AIT GLOBAL</span> TRANSLATOR</h1><p>Multilingual documents · Live chunk output · Downloadable results</p></div>""",unsafe_allow_html=True)
 
 @st.cache_resource(show_spinner="Loading translation model...")
 def load():
