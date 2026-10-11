@@ -330,3 +330,4 @@ def preview(text):
     return text[:DISPLAY_LIMIT] + "\n\n... (preview only - use the download buttons for the full text)"
 
 # ------------------------------------------------------------------ PDF (self-contained
+st.write("DEBUG: reached UI section")
